@@ -492,7 +492,7 @@ object AutomationEngine {
             const id = ${JSONObject.quote(step.domId)}, nm = ${JSONObject.quote(step.name)},
                   css = ${JSONObject.quote(step.cssSelector)}, xpath = ${JSONObject.quote(step.xpath)};
             const labels = ${JSONArray(labels)}.map(function(s) { return String(s).toLowerCase().replace(/\s+/g, ' ').trim(); });
-            const SEL = 'a,button,input[type=submit],input[type=button],input[type=image],[role=button],[role=link],[role=menuitem],[onclick],summary';
+            const SEL = 'a,button,input[type=submit],input[type=button],input[type=image],[role=button],[role=link],[role=menuitem],[role=menuitemradio],[role=option],[role=tab],[role=treeitem],[onclick],[aria-haspopup],[aria-expanded],[aria-controls],[tabindex]:not([tabindex="-1"]),summary,li';
             function visible(el) {
                 if (!el || !el.isConnected) return false;
                 try {
@@ -510,7 +510,23 @@ object AutomationEngine {
                     return exact ? (t === l || a === l || ti === l) : (t.includes(l) || a.includes(l) || ti.includes(l));
                 });
             }
-            function clickable(el) { return (el.closest && el.closest(SEL)) || el; }
+            function clickable(el) {
+                if (!el) return el;
+                const direct = el.closest && el.closest(SEL);
+                if (direct && direct !== document.body && direct !== document.documentElement) return direct;
+                let p = el;
+                for (let i = 0; p && i < 5; i++, p = p.parentElement) {
+                    if (!p || p === document.body || p === document.documentElement) break;
+                    let role = attr(p, 'role'), cls = attr(p, 'class');
+                    let st; try { st = getComputedStyle(p); } catch (_) {}
+                    if (/option|menuitem|treeitem|tab|button|link/.test(role) ||
+                        p.hasAttribute('onclick') || p.hasAttribute('aria-haspopup') ||
+                        p.hasAttribute('aria-expanded') || p.hasAttribute('data-value') ||
+                        (st && st.cursor === 'pointer') ||
+                        /country|region|dropdown|select|option|picker|calendar|date|year/.test(cls)) return p;
+                }
+                return el;
+            }
             function bySelectors() {
                 const tries = [
                     ['id', function() { return id ? document.getElementById(id) : null; }],
@@ -527,12 +543,16 @@ object AutomationEngine {
                 if (!labels.length) return null;
                 const all = Array.from(document.querySelectorAll(SEL)).filter(visible);
                 let e = all.find(function(x) { return textMatches(x, true); }) || all.find(function(x) { return textMatches(x, false); });
-                if (e) return e;
-                const loose = Array.from(document.querySelectorAll('div,span,li,p')).filter(function(x) {
+                if (e) return clickable(e);
+                // Custom country/date menus frequently render the label in a span
+                // while the event handler is delegated to its row or list item.
+                const loose = Array.from(document.querySelectorAll('div,span,li,p,[role=option],[data-value]')).filter(function(x) {
                     if (!visible(x)) return false;
-                    try { return getComputedStyle(x).cursor === 'pointer'; } catch (_) { return false; }
+                    const t = txt(x);
+                    return t.length > 0 && t.length <= 120 && textMatches(x, true);
                 });
-                return loose.find(function(x) { return textMatches(x, true); }) || null;
+                if (loose.length) return clickable(loose[0]);
+                return null;
             }
             function find() {
                 const s = bySelectors(), t = byText();

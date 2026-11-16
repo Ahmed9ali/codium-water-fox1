@@ -73,7 +73,7 @@
     '[role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="switch"], ' +
     '[role="combobox"], [role="textbox"], [role="tab"], [role="menuitem"], [role="option"], ' +
     '[tabindex]:not([tabindex="-1"]), [onclick], ' +
-    '[role="spinbutton"], [role="listbox"], [aria-haspopup], ' +
+    '[role="spinbutton"], [role="listbox"], [role="option"], [role="treeitem"], [role="menuitemradio"], [aria-haspopup], [aria-expanded], [aria-controls], [data-value], ' +
     '[class*="callingCode"], [class*="calling-code"], [class*="countryDropDown"], [class*="country-code"], ' +
     '[class*="countryCode"], [class*="dial-code"], [class*="dialCode"], [class*="birthday"], [class*="bday"], ' +
     '[class*="date-root"], [class*="date-picker"], [class*="datepicker"], ' +
@@ -223,7 +223,21 @@
     const type = (el.type || "").toLowerCase();
     const role = (el.getAttribute("role") || "").toLowerCase();
     const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
-    const c = (getLabel(el) + " " + (el.name || "") + " " + (el.id || "")).toLowerCase();
+    const nearby = [];
+    let node = el;
+    for (let i = 0; node && i < 5; i++, node = node.parentElement) {
+      const t = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+      if (t) nearby.push(t.slice(0, 180));
+      if (node.tagName === "FORM") break;
+    }
+    const c = (getLabel(el) + " " + (el.name || "") + " " + (el.id || "") + " " +
+      (el.getAttribute("aria-label") || "") + " " + (el.getAttribute("placeholder") || "") + " " +
+      (el.getAttribute("data-testid") || "") + " " + nearby.join(" ")).toLowerCase();
+
+    // Date-picker sub-controls (including year/month buttons) should be
+    // grouped as a DOB field, not saved as generic "Button" steps.
+    if (/\b(date\s*of\s*birth|birth\s*date|birthday|date\s*picker|calendar|bday)\b/.test(c) ||
+        (/\b(year|month|day)\b/.test(c) && /\b(birth|dob|birthday)\b/.test(c))) return "dob";
     if (type === "checkbox" || type === "radio" || role === "checkbox" || role === "radio" || role === "switch") {
       if (/\b(gender|sex|male|female)\b/i.test(c)) return "gender";
       return "termscheckbox";
@@ -238,6 +252,8 @@
       }
       if (ac.includes("street")) return "address";
       if (ac.includes("postal")) return "zip";
+      if (ac.includes("country")) return "country";
+      if (ac.includes("bday")) return "dob";
     }
     if (type === "email") return "email";
     if (type === "tel") return "phone";
@@ -250,12 +266,13 @@
     if (/\b(phone|mobile|tel)\b/.test(c)) return "phone";
     if (/\b(password|pass)\b/.test(c)) return "password";
     if (/\b(city)\b/.test(c)) return "city";
-    if (/\b(state)\b/.test(c)) return "state";
+    if (/\b(state|province|region)\b/.test(c)) return "state";
     if (/\b(zip|postal)\b/.test(c)) return "zip";
-    if (/\b(country)\b/.test(c)) return "country";
+    if (/\b(country|nation)\b/.test(c)) return "country";
     if (tag === "textarea" || /\b(message|comment|description)\b/.test(c)) return "message";
     return "text";
   }
+
   function isTextField(el) {
     if (!el) return false;
     const tag = el.tagName;
@@ -373,28 +390,68 @@
     return out;
   }
 
+  function hasWidgetSemantics(el) {
+    if (!el || el.nodeType !== 1) return false;
+    try {
+      const role = (el.getAttribute("role") || "").toLowerCase();
+      const cls = (typeof el.className === "string" ? el.className : "").toLowerCase();
+      return /^(option|menuitem|menuitemradio|menuitemcheckbox|tab|treeitem|radio|checkbox|switch|combobox|listbox|button|link)$/.test(role) ||
+        el.hasAttribute("onclick") || el.hasAttribute("tabindex") ||
+        el.hasAttribute("aria-haspopup") || el.hasAttribute("aria-expanded") ||
+        el.hasAttribute("aria-controls") || el.hasAttribute("data-value") ||
+        /\b(country|region|dropdown|select|option|menu|picker|date|year|month|day|calendar|calling.?code|dial.?code)\b/.test(cls);
+    } catch (_) { return false; }
+  }
+
   function resolveTarget(path) {
     let actual = null;
+    // First prefer a real semantic control, including custom listbox options.
     for (let i = 0; i < path.length; i++) {
       const el = path[i];
       if (el === document.documentElement || el === document.body) break;
       try {
         if (el.tagName === "LABEL" && el.control) { actual = el.control; break; }
-        if (el.matches(INTERACTIVE)) { actual = el; break; }
+        if (el.matches(INTERACTIVE) || hasWidgetSemantics(el)) { actual = el; break; }
       } catch (_) {}
     }
+
+    // Custom controls often put the click handler on a wrapper while the user
+    // taps a nested span/svg. Walk upward and prefer the closest widget wrapper.
     if (!actual) {
-      // non-semantic clickable (div/span with cursor:pointer)
-      const n = Math.min(path.length, CFG.POINTER_SCAN_DEPTH);
+      const n = Math.min(path.length, CFG.POINTER_SCAN_DEPTH + 3);
       for (let i = 0; i < n; i++) {
         const el = path[i];
-        if (el === document.documentElement || el === document.body) break;
-        try { if (getComputedStyle(el).cursor === "pointer") { actual = el; break; } } catch (_) {}
+        if (!el || el === document.documentElement || el === document.body) break;
+        try {
+          const st = getComputedStyle(el);
+          if (st.cursor === "pointer" || hasWidgetSemantics(el)) { actual = el; break; }
+        } catch (_) {}
+      }
+    }
+
+    // Country lists and custom menus commonly use plain li/span nodes with
+    // delegated listeners on the row/list. Record a meaningful row rather
+    // than rejecting the tap as "Nothing recordable: span".
+    if (!actual) {
+      for (let i = 0; i < Math.min(path.length, 5); i++) {
+        const el = path[i];
+        if (!el || el === document.documentElement || el === document.body) break;
+        const tag = (el.tagName || "").toLowerCase();
+        const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+        if ((tag === "li" || tag === "span" || tag === "div") && text.length > 0 && text.length <= 100) {
+          const parent = el.parentElement;
+          const parentRole = parent && (parent.getAttribute("role") || "").toLowerCase();
+          const parentClass = parent && (typeof parent.className === "string" ? parent.className : "").toLowerCase();
+          if (tag === "li" || /listbox|menu|country|region|select|option|dropdown|picker/.test(parentRole + " " + parentClass)) {
+            actual = tag === "span" && el.parentElement ? el.parentElement : el;
+            break;
+          }
+        }
       }
     }
     if (!actual) return null;
 
-    // styled label / text next to a checkbox or radio: record the real control
+    // A visual label next to a native checkbox/radio maps to its real control.
     if (actual.tagName !== "A" && actual.tagName !== "BUTTON") {
       const lab = actual.tagName === "LABEL" ? actual : (actual.closest ? actual.closest("label") : null);
       if (lab) {
@@ -431,10 +488,18 @@
       const tag = actual.tagName.toLowerCase();
       const type = (actual.type || "").toLowerCase();
       const role = (actual.getAttribute("role") || "").toLowerCase();
+      const semanticField = FIELD_ROLES.indexOf(role) !== -1 ||
+        actual.matches("[aria-haspopup='listbox'],[aria-autocomplete],[data-datepicker],[data-date-picker],[class*='date-picker'],[class*='datepicker'],[class*='MuiSelect'],[class*='ant-select'],[class*='react-select']");
+      const inferredType = classify(actual);
+      const datePartText = ((actual.innerText || actual.textContent || "") + " " +
+        (actual.getAttribute("aria-label") || "") + " " +
+        (typeof actual.className === "string" ? actual.className : "")).replace(/\s+/g, " ").trim();
+      const isDatePart = inferredType === "dob" &&
+        (/\b(year|month|day|date)\b/i.test(datePartText) || /^\d{4}$/.test(datePartText));
       const isFieldLike =
         tag === "textarea" || tag === "select" ||
         (tag === "input" && CLICK_INPUT_TYPES.indexOf(type) === -1) ||
-        actual.isContentEditable || FIELD_ROLES.indexOf(role) !== -1;
+        actual.isContentEditable || semanticField || isDatePart;
       const kind = isFieldLike ? "Field" : "ClickNext";
 
       try {
@@ -450,9 +515,20 @@
         domId: actual.id || "",
         placeholder: actual.getAttribute("placeholder") || "",
         ariaLabel: actual.getAttribute("aria-label") || "",
+        role: role,
+        autocomplete: actual.getAttribute("autocomplete") || "",
+        contextLabel: (function () {
+          let p = actual, out = [];
+          for (let i = 0; p && i < 4; i++, p = p.parentElement) {
+            const t = (p.innerText || p.textContent || "").replace(/\s+/g, " ").trim();
+            if (t) out.push(t.slice(0, 120));
+            if (p.tagName === "FORM") break;
+          }
+          return out.join(" | ").slice(0, 300);
+        })(),
         cssSelector: getCssSelector(actual),
         xpath: getXPath(actual),
-        looksLike: isFieldLike ? classify(actual) : "",
+        looksLike: isFieldLike ? inferredType : "",
         displayLabel: label || "Element",
         buttonLabel: kind === "ClickNext" ? (label || "Button") : "",
         verified: true,
