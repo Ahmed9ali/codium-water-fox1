@@ -47,6 +47,8 @@
     city: /\b(city|town|ville)\b/i,
     state: /\b(state|province|region|county)\b/i,
     country: /\b(country|nation)\b/i,
+    countrycode: /\b(country\s*(calling\s*)?code|calling\s*code|dial(?:ling)?\s*code|phone\s*code|countrycode|dialcode)\b/i,
+    currency: /\b(currency|select currency|billing currency|payment currency|iso-4217)\b/i,
     address: /\b(address|street|line\s*1|line\s*2|apartment|apt)\b/i,
     company: /\b(company|organi[sz]ation|employer|business)\b/i,
     jobtitle: /\b(job\s*title|position|role|occupation|designation)\b/i,
@@ -177,8 +179,8 @@
     "new-password": "password", "one-time-code": "otp", tel: "phone", "tel-national": "phone",
     "street-address": "address", "address-line1": "address", "address-line2": "address",
     "address-level1": "state", "address-level2": "city", "postal-code": "zip",
-    country: "country", "country-name": "country", bday: "dob", "bday-day": "dob",
-    "bday-month": "dob", "bday-year": "dob", organization: "company", "organization-title": "jobtitle", sex: "gender",
+    country: "country", "country-name": "country", "bday-day": "dobday",
+    "bday-month": "dobmonth", "bday-year": "dobyear", bday: "dob", organization: "company", "organization-title": "jobtitle", sex: "gender",
   };
 
   function classify(el) {
@@ -196,6 +198,8 @@
       if (RX.gender.test(c)) return "gender";
       return "termscheckbox";
     }
+    if (RX.countrycode.test(c)) return "countrycode";
+    if (RX.currency.test(c)) return "currency";
     if (RX.confirm_password.test(c)) return "confirmpassword";
     if (RX.confirm_email.test(c)) return "confirmemail";
     if (RX.otp.test(c)) return "otp";

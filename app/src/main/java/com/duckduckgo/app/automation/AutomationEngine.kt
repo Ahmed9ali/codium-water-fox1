@@ -1292,7 +1292,7 @@ object AutomationEngine {
             override fun run() {
                 if (hudMode != HudMode.Recording) { recorderPoll = null; return }
                 pollRecorderOnce()
-                mainHandler.postDelayed(this, 400)
+                mainHandler.postDelayed(this, 150)
             }
         }
         recorderPoll = r

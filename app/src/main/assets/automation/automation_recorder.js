@@ -1,5 +1,5 @@
 /*
- * Automation Recorder v18
+ * Automation Recorder v19
  *
  * v18 on top of v17:
  *  - toasts appear ON the tapped element, not at the bottom of the screen
@@ -35,7 +35,7 @@
 (function () {
   "use strict";
   const g = globalThis;
-  const VERSION = "v18";
+  const VERSION = "v19";
   const DEBUG = true;
 
   function log() {
@@ -67,6 +67,10 @@
 
   let lastTarget = null;
   let lastTime = 0;
+  let lastFieldContext = "";
+  let lastFieldContextAt = 0;
+  let highlightedElement = null;
+  let highlightedPreviousOutline = "";
 
   const INTERACTIVE =
     'input, textarea, select, button, a, summary, [contenteditable=""], [contenteditable="true"], ' +
@@ -218,28 +222,69 @@
     return (label || "").replace(/\s+/g, " ").trim().slice(0, 100);
   }
 
+  function localContext(el) {
+    if (!el || !el.closest) return "";
+    // Prefer the nearest field wrapper; never concatenate the entire form/page,
+    // which caused unrelated controls to inherit the same field type.
+    const selectors = [
+      "label", "fieldset", "[role='group']", "[role='radiogroup']",
+      "[data-field]", "[data-testid*='field' i]", "[class*='form-group' i]",
+      "[class*='form-field' i]", "[class*='field-wrapper' i]",
+      "[class*='input-group' i]", "[class*='MuiFormControl' i]"
+    ];
+    for (const selector of selectors) {
+      try {
+        const group = el.closest(selector);
+        if (group) {
+          const text = (group.innerText || group.textContent || "").replace(/\s+/g, " ").trim();
+          if (text && text.length <= 500) return text;
+        }
+      } catch (_) {}
+    }
+    // Portalled menus/dialogs are commonly rendered under document.body.
+    // Use only the nearest popup/listbox/dialog, not arbitrary ancestors.
+    try {
+      const popup = el.closest("[role='dialog'],[role='listbox'],[role='menu'],[aria-modal='true'],[data-radix-popper-content-wrapper],.MuiPopover-root,.MuiMenu-paper,.ant-select-dropdown,.react-select__menu");
+      if (popup) return (popup.innerText || popup.textContent || "").replace(/\s+/g, " ").trim().slice(0, 500);
+    } catch (_) {}
+    return "";
+  }
+
   function classify(el) {
     const tag = (el.tagName || "").toLowerCase();
     const type = (el.type || "").toLowerCase();
     const role = (el.getAttribute("role") || "").toLowerCase();
     const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
-    const nearby = [];
-    let node = el;
-    for (let i = 0; node && i < 5; i++, node = node.parentElement) {
-      const t = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
-      if (t) nearby.push(t.slice(0, 180));
-      if (node.tagName === "FORM") break;
-    }
-    const c = (getLabel(el) + " " + (el.name || "") + " " + (el.id || "") + " " +
-      (el.getAttribute("aria-label") || "") + " " + (el.getAttribute("placeholder") || "") + " " +
-      (el.getAttribute("data-testid") || "") + " " + nearby.join(" ")).toLowerCase();
+    const own = [
+      getLabel(el), el.name, el.id, el.getAttribute("aria-label"),
+      el.getAttribute("placeholder"), el.getAttribute("data-testid"),
+      el.getAttribute("data-field"), el.getAttribute("data-value"),
+      el.getAttribute("title"), el.getAttribute("class")
+    ].filter(Boolean).join(" ").toLowerCase();
+    const context = localContext(el).toLowerCase();
+    const freshContext = Date.now() - lastFieldContextAt < 15000 ? lastFieldContext : "";
+    const c = (own + " " + context + " " + freshContext).replace(/\s+/g, " ").trim();
 
-    // Date-picker sub-controls (including year/month buttons) should be
-    // grouped as a DOB field, not saved as generic "Button" steps.
-    if (/\b(date\s*of\s*birth|birth\s*date|birthday|date\s*picker|calendar|bday)\b/.test(c) ||
-        (/\b(year|month|day)\b/.test(c) && /\b(birth|dob|birthday)\b/.test(c))) return "dob";
+    // Specific subfields must be checked before generic DOB/country rules.
+    if (freshContext === "countryCode" ||
+        /\b(country\s*(calling\s*)?code|calling\s*code|dial(?:ling)?\s*code|phone\s*code|international\s*prefix)\b/.test(c) ||
+        /\b(iti__selected-flag|countrycode|country-code|dialcode|dial-code)\b/.test(own)) return "countryCode";
+    if (/\b(currency|select currency|preferred currency|billing currency|payment currency)\b/.test(c) ||
+        /\b(currency|curr|iso-4217)\b/.test(own)) return "currency";
+
+    const optionText = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+    const inheritedDob = /\b(dob|date of birth|birth date|birthday)\b/.test(freshContext);
+    if (inheritedDob && /^\d{4}$/.test(optionText)) return "dobYear";
+    if (inheritedDob && /\b(year|search year)\b/.test(own)) return "dobYear";
+    if (/\b(date\s*of\s*birth|birth\s*date|birthday|date\s*picker|calendar|bday|dob)\b/.test(c) ||
+        (/\b(year|month|day)\b/.test(c) && /\b(birth|dob|birthday)\b/.test(c))) {
+      if (/\b(year|birth year)\b/.test(own) || /^\d{4}$/.test(optionText)) return "dobYear";
+      if (/\b(month|birth month)\b/.test(own)) return "dobMonth";
+      if (/\b(day|birth day)\b/.test(own)) return "dobDay";
+      return "dob";
+    }
     if (type === "checkbox" || type === "radio" || role === "checkbox" || role === "radio" || role === "switch") {
-      if (/\b(gender|sex|male|female)\b/i.test(c)) return "gender";
+      if (/\b(gender|sex|male|female)\b/.test(c)) return "gender";
       return "termscheckbox";
     }
     if (ac) {
@@ -261,7 +306,7 @@
     if (type === "date") return "dob";
     if (/\b(first|given)\s*name\b|\bfname\b/.test(c)) return "firstName";
     if (/\b(last|family|sur)\s*name\b|\blname\b/.test(c)) return "lastName";
-    if (/\b(full\s*name|your\s*name|name)\b/.test(c)) return "fullName";
+    if (/\b(full\s*name|your\s*name|name)\b/.test(own)) return "fullName";
     if (/\b(e-?mail)\b/.test(c)) return "email";
     if (/\b(phone|mobile|tel)\b/.test(c)) return "phone";
     if (/\b(password|pass)\b/.test(c)) return "password";
@@ -269,7 +314,7 @@
     if (/\b(state|province|region)\b/.test(c)) return "state";
     if (/\b(zip|postal)\b/.test(c)) return "zip";
     if (/\b(country|nation)\b/.test(c)) return "country";
-    if (tag === "textarea" || /\b(message|comment|description)\b/.test(c)) return "message";
+    if (tag === "textarea" || /\b(message|comment|description)\b/.test(own)) return "message";
     return "text";
   }
 
@@ -359,12 +404,16 @@
   }
 
   function sendToBridge(item, targetEl) {
-    if (S.outbox.length === 0 && deliver(item)) { log("delivered to bridge"); return; }
-    if (S.outbox.length >= CFG.OUTBOX_MAX) { warn("outbox full, dropping oldest event"); S.outbox.shift(); }
+    // WebView may expose the JavascriptInterface proxy even when its callback is
+    // not reliably delivered during navigation/document replacement. Queue every
+    // event and let AutomationEngine drain it through evaluateJavascript.
+    if (S.outbox.length >= CFG.OUTBOX_MAX) {
+      warn("outbox full, dropping oldest event");
+      S.outbox.shift();
+    }
     S.outbox.push(item);
-    warn("bridge not ready, queued (outbox=" + S.outbox.length + ")");
-    toast("\u23F3 Sending... (bridge not ready)", "#F59E0B", targetEl);
-    if (!S.pumpTimer) S.pumpTimer = setInterval(pump, CFG.PUMP_MS);
+    log("queued for native recorder (outbox=" + S.outbox.length + ")");
+    toast("Captured — saving…", "#D97706", targetEl);
   }
 
   // ---- target resolution (walks the composed path, so open shadow DOM works) ----
@@ -491,21 +540,38 @@
       const semanticField = FIELD_ROLES.indexOf(role) !== -1 ||
         actual.matches("[aria-haspopup='listbox'],[aria-autocomplete],[data-datepicker],[data-date-picker],[class*='date-picker'],[class*='datepicker'],[class*='MuiSelect'],[class*='ant-select'],[class*='react-select']");
       const inferredType = classify(actual);
+      if (["dob", "country", "countryCode", "currency"].indexOf(inferredType) !== -1) {
+        lastFieldContext = inferredType === "dob" ? "date of birth dob" : inferredType;
+        lastFieldContextAt = Date.now();
+      }
       const datePartText = ((actual.innerText || actual.textContent || "") + " " +
         (actual.getAttribute("aria-label") || "") + " " +
         (typeof actual.className === "string" ? actual.className : "")).replace(/\s+/g, " ").trim();
-      const isDatePart = inferredType === "dob" &&
-        (/\b(year|month|day|date)\b/i.test(datePartText) || /^\d{4}$/.test(datePartText));
+      const isDatePart = ["dob", "dobYear", "dobMonth", "dobDay"].indexOf(inferredType) !== -1;
+      const isSemanticPicker = ["country", "countryCode", "currency"].indexOf(inferredType) !== -1;
       const isFieldLike =
         tag === "textarea" || tag === "select" ||
         (tag === "input" && CLICK_INPUT_TYPES.indexOf(type) === -1) ||
-        actual.isContentEditable || semanticField || isDatePart;
+        actual.isContentEditable || semanticField || isDatePart || isSemanticPicker;
       const kind = isFieldLike ? "Field" : "ClickNext";
 
       try {
-        const old = actual.style.outline;
+        if (highlightedElement && highlightedElement !== actual) {
+          highlightedElement.style.outline = highlightedPreviousOutline;
+        }
+        if (highlightedElement === actual) actual.style.outline = highlightedPreviousOutline;
+        highlightedElement = actual;
+        highlightedPreviousOutline = actual.style.outline || "";
         actual.style.outline = "3px solid #06b6d4";
-        setTimeout(function () { try { actual.style.outline = old; } catch (_) {} }, 600);
+        setTimeout(function () {
+          try {
+            if (highlightedElement === actual) {
+              actual.style.outline = highlightedPreviousOutline;
+              highlightedElement = null;
+              highlightedPreviousOutline = "";
+            }
+          } catch (_) {}
+        }, 650);
       } catch (_) {}
 
       const label = getLabel(actual);
@@ -539,7 +605,6 @@
       S.pending.set(payload.seq, { el: actual, label: payload.displayLabel || tag });
       if (S.pending.size > 30) S.pending.delete(S.pending.keys().next().value);
       sendToBridge(payload, actual);
-      if (S.outbox.length === 0) toast("Grabbed: " + (payload.displayLabel || tag), "#0891B2", actual);
 
       // keyboard is already suppressed through inputmode=none; make sure the field is not left focused
       if (isTextField(actual)) { try { actual.blur(); } catch (_) {} }
