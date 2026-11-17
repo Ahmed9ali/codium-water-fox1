@@ -35,7 +35,7 @@
 (function () {
   "use strict";
   const g = globalThis;
-  const VERSION = "v19";
+  const VERSION = "v20";
   const DEBUG = true;
 
   function log() {
@@ -71,6 +71,7 @@
   let lastFieldContextAt = 0;
   let highlightedElement = null;
   let highlightedPreviousOutline = "";
+  let highlightGeneration = 0;
 
   const INTERACTIVE =
     'input, textarea, select, button, a, summary, [contenteditable=""], [contenteditable="true"], ' +
@@ -82,7 +83,8 @@
     '[class*="countryCode"], [class*="dial-code"], [class*="dialCode"], [class*="birthday"], [class*="bday"], ' +
     '[class*="date-root"], [class*="date-picker"], [class*="datepicker"], ' +
     '.iti__selected-flag, .iti__selected-country, .iti__flag-container, .PhoneInputCountry, .selected-flag, .flag-dropdown, ' +
-    '[data-dial-code], [data-country-code], [data-datepicker], ' +
+    '[data-dial-code], [data-country-code], [data-datepicker], [data-type="fydeos_select"], .choose_value, ' +
+    '#selectedCountry, .hwid-selectedCountryName, [id*="selectedCountry"], ' +
     '.MuiSelect-select, .ant-select-selector, .react-select__control';
   const CLICK_INPUT_TYPES = ["submit", "button", "image", "reset"];
   const FIELD_ROLES = ["checkbox", "radio", "switch", "combobox", "textbox"];
@@ -241,6 +243,18 @@
         }
       } catch (_) {}
     }
+    // Some legacy forms render the field caption as a preceding sibling.
+    // Read only nearby siblings; never concatenate the whole form/page.
+    try {
+      let node = el;
+      for (let depth = 0; node && depth < 3; depth++, node = node.parentElement) {
+        let prev = node.previousElementSibling;
+        for (let n = 0; prev && n < 2; n++, prev = prev.previousElementSibling) {
+          const text = (prev.innerText || prev.textContent || "").replace(/\s+/g, " ").trim();
+          if (text && text.length <= 120) return text;
+        }
+      }
+    } catch (_) {}
     // Portalled menus/dialogs are commonly rendered under document.body.
     // Use only the nearest popup/listbox/dialog, not arbitrary ancestors.
     try {
@@ -259,11 +273,27 @@
       getLabel(el), el.name, el.id, el.getAttribute("aria-label"),
       el.getAttribute("placeholder"), el.getAttribute("data-testid"),
       el.getAttribute("data-field"), el.getAttribute("data-value"),
-      el.getAttribute("title"), el.getAttribute("class")
+      el.getAttribute("data-type"), el.getAttribute("title"), el.getAttribute("class")
     ].filter(Boolean).join(" ").toLowerCase();
     const context = localContext(el).toLowerCase();
-    const freshContext = Date.now() - lastFieldContextAt < 15000 ? lastFieldContext : "";
+    // Remembered picker context applies only to an option inside a popup.
+    // A global 15-second context incorrectly labels unrelated later fields.
+    const popup = el.closest && el.closest("[role='listbox'],[role='menu'],[role='dialog'],[data-radix-popper-content-wrapper],.MuiPopover-root,.MuiMenu-paper,.ant-select-dropdown,.react-select__menu");
+    const optionLike = role === "option" || role === "menuitem" || tag === "li" || !!(popup && el !== popup);
+    const freshContext = optionLike && Date.now() - lastFieldContextAt < 15000 ? lastFieldContext : "";
     const c = (own + " " + context + " " + freshContext).replace(/\s+/g, " ").trim();
+
+    // Explicit custom controls seen in the supplied device captures.
+    const ownText = (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim();
+    if (el.id === "selectedCountry" || /hwid-selectedCountryName/i.test(own) || /selectedcountry/i.test(own)) return "country";
+    if (el.getAttribute("data-type") === "fydeos_select" || /\bchoose_value\b/.test(own)) {
+      if (/\b(year|birth year|date of birth|dob|birthday)\b/.test(context + " " + own)) return "dobYear";
+      if (/\b(month)\b/.test(context + " " + own)) return "dobMonth";
+      if (/\b(day)\b/.test(context + " " + own)) return "dobDay";
+      return "dob";
+    }
+    const hasPhoneSibling = !!(el.parentElement && el.parentElement.querySelector("input[type='tel'],input[autocomplete^='tel'],input[name*='phone' i]"));
+    if (role === "combobox" && /^\+\d{1,4}$/.test(ownText) && (/\b(phone|mobile|tel)\b/.test(context + " " + own) || hasPhoneSibling)) return "countryCode";
 
     // Specific subfields must be checked before generic DOB/country rules.
     if (freshContext === "countryCode" ||
@@ -439,6 +469,19 @@
     return out;
   }
 
+  function isPopupShell(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    return role === "listbox" || role === "menu" || role === "dialog" ||
+      el.hasAttribute("aria-modal") || el.hasAttribute("data-radix-popper-content-wrapper") ||
+      el.matches(".MuiPopover-root,.MuiMenu-paper,.ant-select-dropdown,.react-select__menu");
+  }
+
+  function isCustomSelectLike(el) {
+    if (!el || el.nodeType !== 1) return false;
+    return el.matches("[role='combobox'],[aria-haspopup='listbox'],[data-type='fydeos_select'],.choose_value,#selectedCountry,.hwid-selectedCountryName,[id*='selectedCountry'],.MuiSelect-select,.ant-select-selector,.react-select__control");
+  }
+
   function hasWidgetSemantics(el) {
     if (!el || el.nodeType !== 1) return false;
     try {
@@ -447,7 +490,8 @@
       return /^(option|menuitem|menuitemradio|menuitemcheckbox|tab|treeitem|radio|checkbox|switch|combobox|listbox|button|link)$/.test(role) ||
         el.hasAttribute("onclick") || el.hasAttribute("tabindex") ||
         el.hasAttribute("aria-haspopup") || el.hasAttribute("aria-expanded") ||
-        el.hasAttribute("aria-controls") || el.hasAttribute("data-value") ||
+        el.hasAttribute("aria-controls") || el.hasAttribute("data-value") || el.hasAttribute("data-type") ||
+        isCustomSelectLike(el) ||
         /\b(country|region|dropdown|select|option|menu|picker|date|year|month|day|calendar|calling.?code|dial.?code)\b/.test(cls);
     } catch (_) { return false; }
   }
@@ -459,8 +503,19 @@
       const el = path[i];
       if (el === document.documentElement || el === document.body) break;
       try {
+        if (isPopupShell(el)) continue;
         if (el.tagName === "LABEL" && el.control) { actual = el.control; break; }
-        if (el.matches(INTERACTIVE) || hasWidgetSemantics(el)) { actual = el; break; }
+        if (el.matches(INTERACTIVE) || hasWidgetSemantics(el)) {
+          actual = el;
+          if (el.id === "selectedCountry" || /hwid-selectedCountryName/i.test(String(el.className || ""))) {
+            let owner = el.parentElement;
+            for (let d = 0; owner && d < 3; d++, owner = owner.parentElement) {
+              const st = getComputedStyle(owner);
+              if (st.cursor === "pointer" || owner.hasAttribute("onclick") || owner.getAttribute("role") === "button") { actual = owner; break; }
+            }
+          }
+          break;
+        }
       } catch (_) {}
     }
 
@@ -472,6 +527,7 @@
         const el = path[i];
         if (!el || el === document.documentElement || el === document.body) break;
         try {
+          if (isPopupShell(el)) continue;
           const st = getComputedStyle(el);
           if (st.cursor === "pointer" || hasWidgetSemantics(el)) { actual = el; break; }
         } catch (_) {}
@@ -538,10 +594,10 @@
       const type = (actual.type || "").toLowerCase();
       const role = (actual.getAttribute("role") || "").toLowerCase();
       const semanticField = FIELD_ROLES.indexOf(role) !== -1 ||
-        actual.matches("[aria-haspopup='listbox'],[aria-autocomplete],[data-datepicker],[data-date-picker],[class*='date-picker'],[class*='datepicker'],[class*='MuiSelect'],[class*='ant-select'],[class*='react-select']");
+        actual.matches("[aria-haspopup='listbox'],[aria-autocomplete],[data-datepicker],[data-date-picker],[data-type='fydeos_select'],.choose_value,#selectedCountry,.hwid-selectedCountryName,[id*='selectedCountry'],[class*='date-picker'],[class*='datepicker'],[class*='MuiSelect'],[class*='ant-select'],[class*='react-select']") || isCustomSelectLike(actual);
       const inferredType = classify(actual);
-      if (["dob", "country", "countryCode", "currency"].indexOf(inferredType) !== -1) {
-        lastFieldContext = inferredType === "dob" ? "date of birth dob" : inferredType;
+      if (["dob", "dobYear", "dobMonth", "dobDay", "country", "countryCode", "currency"].indexOf(inferredType) !== -1) {
+        lastFieldContext = inferredType.indexOf("dob") === 0 ? "date of birth dob" : inferredType;
         lastFieldContextAt = Date.now();
       }
       const datePartText = ((actual.innerText || actual.textContent || "") + " " +
@@ -562,10 +618,11 @@
         if (highlightedElement === actual) actual.style.outline = highlightedPreviousOutline;
         highlightedElement = actual;
         highlightedPreviousOutline = actual.style.outline || "";
+        const thisHighlight = ++highlightGeneration;
         actual.style.outline = "3px solid #06b6d4";
         setTimeout(function () {
           try {
-            if (highlightedElement === actual) {
+            if (highlightedElement === actual && highlightGeneration === thisHighlight) {
               actual.style.outline = highlightedPreviousOutline;
               highlightedElement = null;
               highlightedPreviousOutline = "";

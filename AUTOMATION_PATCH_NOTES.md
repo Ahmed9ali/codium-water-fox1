@@ -1,4 +1,4 @@
-# SwiftBrowser automation reliability patch
+# SwiftBrowser automation reliability patch (v20 follow-up)
 
 ## Changes in this source package
 
@@ -38,3 +38,20 @@
 7. Confirm each tap adds exactly one step and only the currently tapped element is outlined.
 
 If an event is rejected, the red acknowledgement should now show the native reason rather than leaving a misleading `Grabbed` toast.
+
+
+## v20 follow-up fixes applied after reviewing device captures
+
+1. `automation_recorder.js`
+   - Removed global field-context contamination: remembered picker context now applies only to option-like elements inside a popup.
+   - Recognizes FydeOS `[data-type="fydeos_select"]` / `.choose_value` controls and derives DOB subfield context from nearby captions.
+   - Recognizes Huawei `#selectedCountry` / `.hwid-selectedCountryName` and promotes the display span to its clickable owner when available.
+   - Recognizes phone country-code comboboxes showing `+NN` when they are in a phone field group or beside a telephone input.
+   - Skips popup shells (`listbox`, `menu`, `dialog`, popover wrappers) as capture targets while still allowing their options to be captured.
+   - Uses a highlight generation token so an older timeout cannot clear a newer highlight on the same element.
+   - Recorder version bumped to v20.
+2. `automation_scanner.js`
+   - Adds the FydeOS and Huawei custom controls to the field scan selector.
+   - Adds nearby field-caption context for custom controls and explicit DOB year/month/day, country, and country-code classification.
+
+Validation: `node --check` passed for both JavaScript files. These changes still require real-device testing on the supplied target sites; no Android build or live-device test is claimed.

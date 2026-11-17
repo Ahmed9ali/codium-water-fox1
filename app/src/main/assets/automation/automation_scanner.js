@@ -170,7 +170,21 @@
   }
 
   function combinedLabel(el) {
-    return [attr(el, "placeholder"), attr(el, "aria-label"), attr(el, "title"), attr(el, "name"), el.id, attr(el, "autocomplete"), attr(el, "inputmode"), attr(el, "data-testid"), attr(el, "data-name"), findLabel(el)].join(" ").toLowerCase();
+    const parts = [attr(el, "placeholder"), attr(el, "aria-label"), attr(el, "title"), attr(el, "name"), el.id, attr(el, "autocomplete"), attr(el, "inputmode"), attr(el, "data-testid"), attr(el, "data-name"), attr(el, "data-type"), findLabel(el)];
+    // Include only nearby captions for custom widgets whose labels are siblings.
+    try {
+      let node = el;
+      for (let depth = 0; node && depth < 3; depth++, node = node.parentElement) {
+        let prev = node.previousElementSibling;
+        for (let n = 0; prev && n < 2; n++, prev = prev.previousElementSibling) {
+          const t = txt(prev);
+          if (t && t.length <= 120) parts.push(t);
+        }
+      }
+      const wrap = el.closest("[data-field],[class*='form-group' i],[class*='form-field' i],[class*='field-wrapper' i],[role='group']");
+      if (wrap) parts.push(txt(wrap).slice(0, 180));
+    } catch (_) {}
+    return parts.filter(Boolean).join(" ").toLowerCase();
   }
 
   const AUTOCOMPLETE_MAP = {
@@ -198,8 +212,16 @@
       if (RX.gender.test(c)) return "gender";
       return "termscheckbox";
     }
-    if (RX.countrycode.test(c)) return "countrycode";
+    const phoneSibling = !!(el.parentElement && el.parentElement.querySelector("input[type='tel'],input[autocomplete^='tel'],input[name*='phone' i]"));
+    if (RX.countrycode.test(c) || (role === "combobox" && /^\+\d{1,4}$/.test(txt(el)) && (RX.phone.test(c) || phoneSibling))) return "countrycode";
     if (RX.currency.test(c)) return "currency";
+    if (/\b(birth|date of birth|dob|birthday)\s*(year|month|day)\b|\b(year|month|day)\s*(of birth|dob)\b/i.test(c)) {
+      if (/\byear\b/i.test(c)) return "dobyear";
+      if (/\bmonth\b/i.test(c)) return "dobmonth";
+      if (/\bday\b/i.test(c)) return "dobday";
+    }
+    if (el.id === "selectedCountry" || /hwid-selectedCountryName|selectedcountry/i.test(c)) return "country";
+    if (attr(el, "data-type") === "fydeos_select" || /\bchoose_value\b/i.test(c)) return "dob";
     if (RX.confirm_password.test(c)) return "confirmpassword";
     if (RX.confirm_email.test(c)) return "confirmemail";
     if (RX.otp.test(c)) return "otp";
@@ -227,13 +249,14 @@
   function isCustomSelectTrigger(el) {
     if (!el) return false;
     const role = attr(el, "role").toLowerCase();
-    if (role === "combobox" || role === "listbox" || attr(el, "aria-haspopup") === "listbox") return true;
+    if (role === "combobox" || role === "listbox" || attr(el, "aria-haspopup") === "listbox" ||
+        attr(el, "data-type") === "fydeos_select" || el.matches(".choose_value,#selectedCountry,.hwid-selectedCountryName,[id*='selectedCountry']")) return true;
     const cls = (el.className || "").toString().toLowerCase();
     if (/\b(mui-?select|ant-?select|chakra-?select|react-?select|rs-?select|v-?select|select2|choices|dd-?trigger|dd-?toggle)\b/.test(cls)) return true;
     return false;
   }
 
-  const FIELD_SELECTOR = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]), textarea, select, [role=combobox], [role=textbox], [contenteditable="true"], [contenteditable=""], .dd, .ctl, .select-trigger, [data-dropdown], [data-select]';
+  const FIELD_SELECTOR = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]), textarea, select, [role=combobox], [role=textbox], [contenteditable="true"], [contenteditable=""], .dd, .ctl, .select-trigger, [data-dropdown], [data-select], [data-type="fydeos_select"], .choose_value, #selectedCountry, .hwid-selectedCountryName, [id*="selectedCountry"], [aria-haspopup="listbox"], .MuiSelect-select, .ant-select-selector, .react-select__control';
   const BUTTON_SELECTOR = 'button, a[role=button], input[type=submit], input[type=button], input[type=image], [role=button]:not(a), [onclick]';
 
   function collectAll(doc, selector) {
@@ -454,7 +477,9 @@
       return true;
     }
     if (isCustomSelectTrigger(el)) {
-      const trigger = el.matches("button,[role=combobox],[aria-haspopup]") ? el : el.querySelector("button, [role=combobox], [aria-haspopup], .ctl, .select-trigger");
+      const trigger = el.matches("button,[role=combobox],[aria-haspopup],[data-type='fydeos_select'],.choose_value,.MuiSelect-select,.ant-select-selector,.react-select__control")
+        ? el
+        : (el.closest("button,[role=combobox],[aria-haspopup],[data-type='fydeos_select'],.choose_value,.MuiSelect-select,.ant-select-selector,.react-select__control,[onclick],[tabindex]") || el.querySelector("button, [role=combobox], [aria-haspopup], .ctl, .select-trigger") || el);
       if (!trigger) return false;
       simulateClick(trigger); await sleep(300);
       const target = value.trim().toLowerCase();
