@@ -44,17 +44,26 @@ data class ActiveAutomationProfile(
             fields[normalizedName]?.let { if (it.isNotBlank()) return it }
         }
 
-        // 3. Fuzzy match fallback
-        val fuzzyMatch = fields.entries.firstOrNull { 
-            it.value.isNotBlank() && (it.key.contains(normalizedType) || normalizedType.contains(it.key)) 
+        // 3. Fuzzy matching is unsafe for semantically distinct selectors such as
+        // country vs country-code and DOB vs birth-year. Keep those exact-only.
+        val exactOnlyTypes = setOf("country", "countrycode", "dob", "dobyear", "dobmonth", "dobday")
+        if (normalizedType !in exactOnlyTypes) {
+            val fuzzyMatch = fields.entries.firstOrNull {
+                it.value.isNotBlank() && it.key.isNotBlank() &&
+                    (it.key.contains(normalizedType) || normalizedType.contains(it.key))
+            }
+            if (fuzzyMatch != null) return fuzzyMatch.value
         }
-        if (fuzzyMatch != null) return fuzzyMatch.value
 
         // 4. Strict fallbacks
         return when (normalizedType) {
             "confirmpassword" -> fields["password"]
             "confirmemail" -> fields["email"]
             "confirmphone" -> fields["phone"]
+            "dobyear" -> fields["birthyear"] ?: fields["yearofbirth"]
+            "dobmonth" -> fields["birthmonth"]
+            "dobday" -> fields["birthday"]
+            "countrycode" -> fields["dialcode"] ?: fields["isdcode"] ?: fields["phonecode"]
             "firstname" -> fields["fullname"]?.trim()?.substringBefore(" ") ?: fields["username"]
             "middlename" -> null 
             "lastname" -> fields["surname"] ?: fields["fullname"]?.trim()?.substringAfter(" ", "")?.takeIf { it.isNotBlank() }
@@ -67,6 +76,9 @@ data class ActiveAutomationProfile(
             "username" -> fields["email"]?.substringBefore("@") ?: fields["fullname"]?.replace(" ", "_")
             "message" -> fields["message"] ?: fields["subject"] ?: fields["text"]
             "subject" -> fields["subject"] ?: fields["message"] ?: fields["text"]
+            // Never substitute generic text for structured selectors. A country
+            // name, dial code, and birth-year value must come from their own pool.
+            "country", "countrycode", "dob", "dobyear", "dobmonth", "dobday" -> null
             "text" -> {
                 if (tag == "textarea") {
                     fields["message"] ?: fields["text"] ?: fields["subject"]
@@ -327,14 +339,17 @@ object VaultRepository {
             clean in listOf("username", "userid", "user", "login", "handle") -> "username"
             clean in listOf("message", "yourmessage", "comments", "comment", "body", "description", "bio", "inquiry") -> "message"
             clean in listOf("subject", "title", "topic", "reason") -> "subject"
-            clean in listOf("dob", "dateofbirth", "birthdate", "birthday", "date") -> "dob"
+            clean in listOf("birthyear", "yearofbirth", "dobyear", "bdayyear", "yearbirth") -> "dobyear"
+            clean in listOf("birthmonth", "monthofbirth", "dobmonth", "bdaymonth") -> "dobmonth"
+            clean in listOf("dayofbirth", "dobday", "bdayday") -> "dobday"
+            clean in listOf("dob", "dateofbirth", "birthdate", "birthday", "bday", "date") -> "dob"
             clean in listOf("gender", "sex") -> "gender"
             clean in listOf("address", "street", "streetaddress", "addr", "house") -> "address"
             clean in listOf("city", "town", "locality") -> "city"
             clean in listOf("state", "province", "region") -> "state"
             clean in listOf("zip", "zipcode", "postal", "postalcode", "pincode", "pin") -> "zip"
             clean in listOf("country", "nation") -> "country"
-            clean in listOf("countrycode", "dialcode", "isdcode", "phonecode") -> "countrycode"
+            clean in listOf("countrycode", "countrycallingcode", "callingcode", "dialcode", "diallingcode", "isdcode", "phonecode") -> "countrycode"
             clean in listOf("company", "organization", "organisation", "business") -> "company"
             clean in listOf("jobtitle", "designation", "position", "role") -> "jobtitle"
             clean in listOf("otp", "code", "verificationcode") -> "otp"

@@ -82,7 +82,7 @@ object AutomationEngine {
     private const val PAGE_READY_TIMEOUT_MS = 10_000L
     private const val PAGE_READY_POST_MS = 1_000L
 
-    private val DYNAMIC_FIELDS = setOf("email", "confirmemail", "phone", "confirmphone", "username", "otp")
+    private val DYNAMIC_FIELDS = setOf("email", "confirmemail", "phone", "confirmphone", "username", "otp", "country", "countrycode", "dob", "dobyear", "dobmonth", "dobday")
 
     private var currentWebView: WeakReference<WebView>? = null
     private var scannerJs: String? = null
@@ -473,13 +473,13 @@ object AutomationEngine {
 
     private fun resolveFieldValue(step: RecordedStep, recurringProfile: ActiveAutomationProfile, defaultProfile: ActiveAutomationProfile?): String {
         if (step.customValue.isNotBlank()) return step.customValue
-        val looksLike = step.fieldType.lowercase()
+        val looksLike = VaultRepository.normalizeFieldKey(step.fieldType)
         val isDynamic = DYNAMIC_FIELDS.contains(looksLike)
         val primary = if (isDynamic) recurringProfile else defaultProfile
         val fallback = if (isDynamic) defaultProfile else recurringProfile
-        val v1 = primary?.resolveForField(step.fieldType, step.name, step.tag)
+        val v1 = primary?.resolveForField(looksLike, step.name, step.tag)
         if (!v1.isNullOrBlank()) return v1
-        return fallback?.resolveForField(step.fieldType, step.name, step.tag) ?: ""
+        return fallback?.resolveForField(looksLike, step.name, step.tag) ?: ""
     }
 
     private fun buildClickJs(step: RecordedStep): String {
@@ -598,113 +598,131 @@ object AutomationEngine {
 
     private fun buildFillJs(step: RecordedStep, value: String, humanize: Boolean): String {
         val hints = listOf(step.placeholder, step.ariaLabel, step.displayLabel, step.fieldType)
-            .map { it.trim() }
-            .filter { it.isNotBlank() }
-            .distinct()
+            .map { it.trim() }.filter { it.isNotBlank() }.distinct()
         return """
         (async function() {
             const id = ${JSONObject.quote(step.domId)}, nm = ${JSONObject.quote(step.name)},
                   css = ${JSONObject.quote(step.cssSelector)}, xpath = ${JSONObject.quote(step.xpath)};
-            const hints = ${JSONArray(hints)}.map(function(s) { return String(s).toLowerCase(); });
+            const hints = ${JSONArray(hints)}.map(s => String(s).toLowerCase());
             const wanted = ${JSONObject.quote(value)};
+            const fieldType = ${JSONObject.quote(step.fieldType.lowercase())};
             const humanize = ${if (humanize) "true" else "false"};
-            function isBoxy(el) { return !!el && el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio'); }
-            function visible(el) {
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
+            const text = el => String(el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim();
+            const visible = el => {
                 if (!el || !el.isConnected) return false;
-                if (isBoxy(el)) return true;
-                try {
-                    const st = getComputedStyle(el);
-                    if (st.display === 'none' || st.visibility === 'hidden') return false;
-                    const r = el.getBoundingClientRect();
-                    return r.width > 0 && r.height > 0;
+                try { const st = el.ownerDocument.defaultView.getComputedStyle(el), r = el.getBoundingClientRect();
+                    return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity) !== 0 && r.width > 0 && r.height > 0;
                 } catch (_) { return false; }
-            }
-            function realVisible(el) {
-                try { const r = el.getBoundingClientRect(); return r.width > 4 && r.height > 4 && getComputedStyle(el).opacity !== '0'; }
-                catch (_) { return false; }
-            }
-            function bySelectors() {
+            };
+            const dispatch = (el, type) => { const w = el.ownerDocument.defaultView; el.dispatchEvent(new w.Event(type, {bubbles:true, composed:true})); };
+            function findElement() {
+                const doc = document;
                 const tries = [
-                    function() { return id ? document.getElementById(id) : null; },
-                    function() { return css ? document.querySelector(css) : null; },
-                    function() { return xpath ? document.evaluate(xpath, document, null, 9, null).singleNodeValue : null; },
-                    function() { return nm ? document.getElementsByName(nm)[0] : null; }
+                    () => id ? doc.getElementById(id) : null,
+                    () => css ? doc.querySelector(css) : null,
+                    () => xpath ? doc.evaluate(xpath, doc, null, 9, null).singleNodeValue : null,
+                    () => nm ? doc.getElementsByName(nm)[0] : null
                 ];
-                for (const t of tries) { try { const e = t(); if (e && visible(e)) return e; } catch (_) {} }
-                return null;
-            }
-            function byHints() {
-                const els = Array.from(document.querySelectorAll('input:not([type=hidden]),textarea,select')).filter(visible);
-                for (const h of hints) {
-                    const e = els.find(function(x) {
-                        const c = ((x.name || '') + ' ' + (x.id || '') + ' ' + (x.placeholder || '') + ' ' +
-                                   (x.getAttribute('aria-label') || '') + ' ' + (x.autocomplete || '')).toLowerCase();
-                        return c.includes(h);
-                    });
-                    if (e) return e;
+                for (const fn of tries) { try { const el = fn(); if (visible(el)) return el; } catch (_) {} }
+                const all = Array.from(doc.querySelectorAll('input:not([type=hidden]),textarea,select,button,[role=combobox],[aria-haspopup],.choose_value,#selectedCountry,.hwid-selectedCountryName,[id*=selectedCountry]')).filter(visible);
+                for (const hint of hints) {
+                    const found = all.find(el => ((el.name || '')+' '+(el.id || '')+' '+(el.getAttribute('placeholder') || '')+' '+(el.getAttribute('aria-label') || '')+' '+text(el)).toLowerCase().includes(hint));
+                    if (found) return found;
                 }
                 return null;
             }
-            const start = Date.now();
+            function click(el) {
+                if (!el) return false;
+                try { el.scrollIntoView({block:'center'}); } catch (_) {}
+                try { el.click(); return true; } catch (_) { return false; }
+            }
+            function findOptions(doc) {
+                const selectors = '[role=option],[role=menuitem],li,button,[data-value],[data-country],.dropdown-item,.country-item,.year-item,.MuiMenuItem-root,.ant-select-item-option,.hwid-country-item,.hwid-country-list li';
+                try { return Array.from(doc.querySelectorAll(selectors)).filter(visible); } catch (_) { return []; }
+            }
+            function normalize(s) { return String(s || '').trim().toLowerCase().replace(/[\s\u00a0]+/g,' '); }
+            function optionMatches(el, wantedValue, type) {
+                const label = normalize(text(el));
+                const val = normalize(el.getAttribute('data-value') || el.getAttribute('data-country') || el.getAttribute('value') || '');
+                const target = normalize(wantedValue);
+                if (!target) return false;
+                if (label === target || val === target) return true;
+                if (type === 'countrycode') {
+                    const digits = target.replace(/[^+0-9]/g,'');
+                    return digits.length > 1 && (label.replace(/[^+0-9]/g,'') === digits || val.replace(/[^+0-9]/g,'') === digits);
+                }
+                return label.includes(target) || val.includes(target);
+            }
+            async function chooseCustom(el) {
+                // A selected-value span (Huawei ID) belongs to its clickable country row.
+                let trigger = el;
+                if (el.id === 'selectedCountry' || el.matches('.hwid-selectedCountryName,[id*=selectedCountry]')) {
+                    trigger = el.closest('[role=button],button,[onclick],.hwid-countryWidthFix,.hwid-selectedCountryName') || el;
+                }
+                if (el.matches('.choose_value,[data-type=fydeos_select]')) trigger = el;
+                if (!click(trigger)) return {ok:false,err:'custom select trigger could not be clicked'};
+                await sleep(350);
+                const doc = el.ownerDocument;
+                let options = findOptions(doc);
+                // FydeOS year selector can render a plain list without option roles.
+                if (fieldType === 'dobyear' || el.matches('.choose_value,[data-type=fydeos_select]')) {
+                    const yearNodes = Array.from(doc.querySelectorAll('li,button,[role=option],div,span')).filter(visible)
+                        .filter(n => /^\d{4}$/.test(text(n)));
+                    options = options.concat(yearNodes);
+                }
+                // Huawei's list is often rendered in a portal elsewhere in the same document.
+                const found = options.find(o => optionMatches(o, wanted, fieldType));
+                if (found) { click(found); await sleep(250); return {ok:true}; }
+                // If the clicked span was nested, retry its closest obvious row/container.
+                const parent = trigger.parentElement;
+                if (parent) {
+                    const nested = findOptions(doc).find(o => optionMatches(o, wanted, fieldType));
+                    if (nested) { click(nested); await sleep(250); return {ok:true}; }
+                }
+                return {ok:false,err:'opened custom selector but no matching option found: '+wanted};
+            }
+            const started = Date.now();
             let el = null;
-            while (Date.now() - start < 10000) {
-                el = bySelectors() || byHints();
-                if (el) break;
-                await new Promise(function(r) { setTimeout(r, 300); });
-            }
-            if (!el) return JSON.stringify({ok: false, err: 'field not found (id/css/xpath/name/hints=' + JSON.stringify(hints) + ')'});
+            while (Date.now() - started < 10000 && !el) { el = findElement(); if (!el) await sleep(250); }
+            if (!el) return JSON.stringify({ok:false,err:'field not found'});
             try {
-                el.scrollIntoView({block: 'center'});
-                try { el.focus(); } catch (_) {}
-
-                if (isBoxy(el)) {
-                    const want = !/^(false|0|no)${'$'}/i.test(wanted.trim());
-                    if (el.checked !== want) {
-                        const lab = (el.labels && el.labels[0]) || el.closest('label');
-                        (lab && !realVisible(el) ? lab : el).click();
-                        if (el.checked !== want) { el.checked = want; el.dispatchEvent(new Event('change', {bubbles: true})); }
-                    }
-                    return JSON.stringify({ok: el.checked === want, err: 'checkbox state did not change'});
+                const tag = (el.tagName || '').toLowerCase();
+                const type = (el.type || '').toLowerCase();
+                const isCustom = el.matches('button,[role=combobox],[aria-haspopup],.choose_value,[data-type=fydeos_select],#selectedCountry,.hwid-selectedCountryName,[id*=selectedCountry]') ||
+                    (tag !== 'input' && tag !== 'textarea' && tag !== 'select' && (el.getAttribute('role') === 'button' || el.hasAttribute('onclick')));
+                if (isCustom) return JSON.stringify(await chooseCustom(el));
+                if (!wanted) return JSON.stringify({ok:false,err:'no data value available for this field: '+fieldType});
+                if (type === 'checkbox' || type === 'radio') {
+                    const want = !/^(false|0|no|off)$/i.test(wanted.trim());
+                    if (el.checked !== want) el.click();
+                    return JSON.stringify({ok:el.checked === want});
                 }
-
-                if (!wanted) return JSON.stringify({ok: false, err: 'no data value available for this field'});
-
-                if (el.tagName === 'SELECT') {
-                    const w = wanted.toLowerCase().trim();
-                    const opt = Array.from(el.options).find(function(o) { return o.value.toLowerCase() === w || o.text.toLowerCase().trim() === w; })
-                             || Array.from(el.options).find(function(o) { return o.text.toLowerCase().includes(w); });
-                    if (!opt) return JSON.stringify({ok: false, err: 'no option matches the value'});
-                    el.value = opt.value;
-                    el.dispatchEvent(new Event('input', {bubbles: true}));
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                    return JSON.stringify({ok: true});
+                if (tag === 'select') {
+                    const target = normalize(wanted);
+                    const opt = Array.from(el.options).find(o => normalize(o.value) === target || normalize(o.textContent) === target) ||
+                        Array.from(el.options).find(o => normalize(o.textContent).includes(target));
+                    if (!opt) return JSON.stringify({ok:false,err:'no option matches '+wanted});
+                    el.value = opt.value; dispatch(el,'input'); dispatch(el,'change'); return JSON.stringify({ok:true});
                 }
-
-                const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-                const setter = (Object.getOwnPropertyDescriptor(proto, 'value') || {}).set;
-                function setVal(v) {
-                    if (setter) setter.call(el, v); else el.value = v;
-                    if (el._valueTracker) el._valueTracker.setValue('');
+                if (tag !== 'input' && tag !== 'textarea') {
+                    if (el.isContentEditable) { el.textContent = wanted; dispatch(el,'input'); return JSON.stringify({ok:true}); }
+                    return JSON.stringify({ok:false,err:'unsupported field element '+tag});
                 }
-                setVal('');
-                el.dispatchEvent(new Event('input', {bubbles: true}));
+                const win = el.ownerDocument.defaultView;
+                const proto = tag === 'textarea' ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
+                const descriptor = Object.getOwnPropertyDescriptor(proto,'value');
+                const setter = descriptor && descriptor.set;
+                if (!setter) return JSON.stringify({ok:false,err:'native value setter unavailable'});
+                const setValue = v => setter.call(el,v);
+                setValue(''); dispatch(el,'input');
                 if (humanize) {
-                    let cur = '';
-                    for (let i = 0; i < wanted.length; i++) {
-                        cur += wanted[i];
-                        setVal(cur);
-                        el.dispatchEvent(new Event('input', {bubbles: true}));
-                        await new Promise(function(r) { setTimeout(r, 50 + Math.random() * 100); });
-                    }
-                } else {
-                    setVal(wanted);
-                    if (el.value !== wanted) { try { el.select(); document.execCommand('insertText', false, wanted); } catch (_) {} }
-                    el.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
-                }
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-                el.dispatchEvent(new Event('blur', {bubbles: true}));
-                return JSON.stringify({ok: el.value === wanted, err: 'value did not stick (site reset the field)'});
-            } catch (e) { return JSON.stringify({ok: false, err: 'fill error: ' + e.message}); }
+                    let current = '';
+                    for (const ch of wanted) { current += ch; setValue(current); dispatch(el,'input'); await sleep(50 + Math.random()*80); }
+                } else { setValue(wanted); dispatch(el,'input'); }
+                dispatch(el,'change');
+                return JSON.stringify({ok:el.value === wanted,err:'value did not stick'});
+            } catch (e) { return JSON.stringify({ok:false,err:'fill error: '+(e && e.message || String(e))}); }
         })()
         """.trimIndent()
     }
@@ -897,11 +915,12 @@ object AutomationEngine {
                     val matched = when {
                         looksLike == "termsCheckbox" -> "true"
                         else -> {
-                            val isDynamic = DYNAMIC_FIELDS.contains(looksLike.lowercase())
+                            val canonicalType = VaultRepository.normalizeFieldKey(looksLike)
+                            val isDynamic = DYNAMIC_FIELDS.contains(canonicalType)
                             val primary = if (isDynamic) activeProfile else defaultProfile
                             val fallback = if (isDynamic) defaultProfile else activeProfile
-                            val v1 = primary?.resolveForField(looksLike, f.optString("name"), f.optString("tag"))
-                            if (!v1.isNullOrBlank()) v1 else fallback?.resolveForField(looksLike, f.optString("name"), f.optString("tag"))
+                            val v1 = primary?.resolveForField(canonicalType, f.optString("name"), f.optString("tag"))
+                            if (!v1.isNullOrBlank()) v1 else fallback?.resolveForField(canonicalType, f.optString("name"), f.optString("tag"))
                         }
                     }
                     if (!matched.isNullOrBlank()) {

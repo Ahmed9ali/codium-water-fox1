@@ -170,7 +170,21 @@
   }
 
   function combinedLabel(el) {
-    return [attr(el, "placeholder"), attr(el, "aria-label"), attr(el, "title"), attr(el, "name"), el.id, attr(el, "autocomplete"), attr(el, "inputmode"), attr(el, "data-testid"), attr(el, "data-name"), findLabel(el)].join(" ").toLowerCase();
+    const parts = [attr(el, "placeholder"), attr(el, "aria-label"), attr(el, "title"), attr(el, "name"), el.id, attr(el, "autocomplete"), attr(el, "inputmode"), attr(el, "data-testid"), attr(el, "data-name"), attr(el, "data-type"), findLabel(el)];
+    // Include only nearby captions for custom widgets whose labels are siblings.
+    try {
+      let node = el;
+      for (let depth = 0; node && depth < 3; depth++, node = node.parentElement) {
+        let prev = node.previousElementSibling;
+        for (let n = 0; prev && n < 2; n++, prev = prev.previousElementSibling) {
+          const t = txt(prev);
+          if (t && t.length <= 120) parts.push(t);
+        }
+      }
+      const wrap = el.closest("[data-field],[class*='form-group' i],[class*='form-field' i],[class*='field-wrapper' i],[role='group']");
+      if (wrap) parts.push(txt(wrap).slice(0, 180));
+    } catch (_) {}
+    return parts.filter(Boolean).join(" ").toLowerCase();
   }
 
   const AUTOCOMPLETE_MAP = {
@@ -198,8 +212,16 @@
       if (RX.gender.test(c)) return "gender";
       return "termscheckbox";
     }
-    if (RX.countrycode.test(c)) return "countrycode";
+    const phoneSibling = !!(el.parentElement && el.parentElement.querySelector("input[type='tel'],input[autocomplete^='tel'],input[name*='phone' i]"));
+    if (RX.countrycode.test(c) || (role === "combobox" && /^\+\d{1,4}$/.test(txt(el)) && (RX.phone.test(c) || phoneSibling))) return "countrycode";
     if (RX.currency.test(c)) return "currency";
+    if (/\b(birth|date of birth|dob|birthday)\s*(year|month|day)\b|\b(year|month|day)\s*(of birth|dob)\b/i.test(c)) {
+      if (/\byear\b/i.test(c)) return "dobyear";
+      if (/\bmonth\b/i.test(c)) return "dobmonth";
+      if (/\bday\b/i.test(c)) return "dobday";
+    }
+    if (el.id === "selectedCountry" || /hwid-selectedCountryName|selectedcountry/i.test(c)) return "country";
+    if (attr(el, "data-type") === "fydeos_select" || /\bchoose_value\b/i.test(c)) return "dobyear";
     if (RX.confirm_password.test(c)) return "confirmpassword";
     if (RX.confirm_email.test(c)) return "confirmemail";
     if (RX.otp.test(c)) return "otp";
@@ -227,13 +249,14 @@
   function isCustomSelectTrigger(el) {
     if (!el) return false;
     const role = attr(el, "role").toLowerCase();
-    if (role === "combobox" || role === "listbox" || attr(el, "aria-haspopup") === "listbox") return true;
+    if (role === "combobox" || role === "listbox" || attr(el, "aria-haspopup") === "listbox" ||
+        attr(el, "data-type") === "fydeos_select" || el.matches(".choose_value,#selectedCountry,.hwid-selectedCountryName,[id*='selectedCountry']")) return true;
     const cls = (el.className || "").toString().toLowerCase();
     if (/\b(mui-?select|ant-?select|chakra-?select|react-?select|rs-?select|v-?select|select2|choices|dd-?trigger|dd-?toggle)\b/.test(cls)) return true;
     return false;
   }
 
-  const FIELD_SELECTOR = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]), textarea, select, [role=combobox], [role=textbox], [contenteditable="true"], [contenteditable=""], .dd, .ctl, .select-trigger, [data-dropdown], [data-select]';
+  const FIELD_SELECTOR = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]), textarea, select, [role=combobox], [role=textbox], [contenteditable="true"], [contenteditable=""], .dd, .ctl, .select-trigger, [data-dropdown], [data-select], [data-type="fydeos_select"], .choose_value, #selectedCountry, .hwid-selectedCountryName, [id*="selectedCountry"], [aria-haspopup="listbox"], .MuiSelect-select, .ant-select-selector, .react-select__control';
   const BUTTON_SELECTOR = 'button, a[role=button], input[type=submit], input[type=button], input[type=image], [role=button]:not(a), [onclick]';
 
   function collectAll(doc, selector) {
@@ -384,7 +407,7 @@
     const type = (el.type || "").toLowerCase();
     
     // BUG FIX: Handle Date inputs properly (e.g. 15/05/1990 -> 1990-05-15)
-    const isDate = type === "date" || type === "datetime-local" || classify(el) === "dob";
+    const isDate = type === "date" || type === "datetime-local" || (classify(el) === "dob" && (tag === "input" || tag === "textarea"));
     if (isDate) {
       const wasReadonly = el.hasAttribute('readonly');
       if (wasReadonly) el.removeAttribute('readonly');
@@ -396,8 +419,10 @@
       }
       
       try {
-        originalFocus.call(el);
-        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+        const view = el.ownerDocument.defaultView;
+        const focusDescriptor = Object.getOwnPropertyDescriptor(view.HTMLElement.prototype, "focus");
+        if (focusDescriptor && focusDescriptor.value) focusDescriptor.value.call(el);
+        const setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, "value")?.set;
         if (setter) setter.call(el, finalValue);
         else el.value = finalValue;
         
@@ -425,10 +450,15 @@
     if (tag === "input" || tag === "textarea") {
       const wasReadonly = el.hasAttribute('readonly');
       el.setAttribute('readonly', 'true');
-      try { originalFocus.call(el); } catch (_) {}
+      const view = el.ownerDocument.defaultView;
+      try {
+        const focusDescriptor = Object.getOwnPropertyDescriptor(view.HTMLElement.prototype, "focus");
+        if (focusDescriptor && focusDescriptor.value) focusDescriptor.value.call(el);
+      } catch (_) {}
       
-      const proto = el.tagName.toLowerCase() === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+      const proto = el.tagName.toLowerCase() === "textarea" ? view.HTMLTextAreaElement.prototype : view.HTMLInputElement.prototype;
+      const valueDescriptor = Object.getOwnPropertyDescriptor(proto, "value");
+      const setter = valueDescriptor && valueDescriptor.set;
       
       if (!opts.humanize) {
         try { if (setter) setter.call(el, value); else el.value = value; } catch (_) { el.value = value; }
@@ -450,23 +480,40 @@
       return true;
     }
     if (el.isContentEditable) {
-      try { originalFocus.call(el); el.innerText = value; dispatchElementEvent(el, "input", { bubbles: true, data: value, inputType: "insertText" }, true); } catch (_) { el.textContent = value; dispatchElementEvent(el, "input"); }
+      try { el.innerText = value; dispatchElementEvent(el, "input", { bubbles: true, data: value, inputType: "insertText" }, true); } catch (_) { el.textContent = value; dispatchElementEvent(el, "input"); }
       return true;
     }
     if (isCustomSelectTrigger(el)) {
-      const trigger = el.matches("button,[role=combobox],[aria-haspopup]") ? el : el.querySelector("button, [role=combobox], [aria-haspopup], .ctl, .select-trigger");
-      if (!trigger) return false;
-      simulateClick(trigger); await sleep(300);
-      const target = value.trim().toLowerCase();
+      const doc = el.ownerDocument || document;
+      let trigger = el;
+      if (el.id === "selectedCountry" || el.matches(".hwid-selectedCountryName,[id*='selectedCountry']")) {
+        trigger = el.closest("button,[role=button],[onclick],.hwid-countryWidthFix") || el;
+      } else if (!el.matches("button,[role=combobox],[aria-haspopup],[data-type='fydeos_select'],.choose_value,.MuiSelect-select,.ant-select-selector,.react-select__control")) {
+        trigger = el.closest("button,[role=combobox],[aria-haspopup],[data-type='fydeos_select'],.choose_value,.MuiSelect-select,.ant-select-selector,.react-select__control,[onclick],[tabindex]") || el.querySelector("button,[role=combobox],[aria-haspopup],.ctl,.select-trigger") || el;
+      }
+      if (!trigger || !simulateClick(trigger)) return false;
+      await sleep(350);
+      const target = value.trim().toLowerCase().replace(/\s+/g, " ");
+      const selectors = ['[role=option]','[role=menuitem]','.MuiMenuItem-root','.ant-select-item-option','.chakra-menu__menuitem','[data-radix-collection-item]','.dd-i','.dropdown-item','.select-option','[data-value]','[data-country]','.hwid-country-item','.hwid-country-list li','li','button','.year-item'];
       const candidates = [];
-      for (const s of ['[role=option]','[role=menuitem]','.MuiMenuItem-root','.ant-select-item-option','.chakra-menu__menuitem','[data-radix-collection-item]','.dd-i','.dropdown-item','.select-option']) {
-        for (const n of collectAll(el.ownerDocument || document, s)) {
-          if (isVisible(n) && !isDisabled(n)) candidates.push(n);
+      for (const n of collectAll(doc, selectors.join(","))) {
+        if (isVisible(n) && !isDisabled(n) && !candidates.includes(n)) candidates.push(n);
+      }
+      // FydeOS renders a plain year list; it has no input and no option role.
+      if (el.matches(".choose_value,[data-type='fydeos_select']") || classify(el) === "dobyear") {
+        for (const n of collectAll(doc, "li,button,[role=option],div,span")) {
+          if (/^\d{4}$/.test(txt(n)) && isVisible(n) && !candidates.includes(n)) candidates.push(n);
         }
       }
-      let chosen = candidates.find(c => (txt(c) || "").toLowerCase() === target) || candidates.find(c => (txt(c) || "").toLowerCase().includes(target));
+      const normalize = s => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+      const digits = target.replace(/[^+0-9]/g, "");
+      let chosen = candidates.find(c => normalize(txt(c)) === target || normalize(attr(c, "data-value")) === target || normalize(attr(c, "data-country")) === target);
+      if (!chosen && classify(el) === "countrycode" && digits.length > 1) {
+        chosen = candidates.find(c => (txt(c) + " " + attr(c, "data-value")).replace(/[^+0-9]/g, "") === digits);
+      }
+      if (!chosen) chosen = candidates.find(c => normalize(txt(c)).includes(target) || normalize(attr(c, "data-value")).includes(target));
       if (chosen) { simulateClick(chosen); await sleep(250); return true; }
-      simulateClick(trigger); await sleep(150); return false;
+      return false;
     }
     return false;
   }
