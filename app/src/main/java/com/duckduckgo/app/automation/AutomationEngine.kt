@@ -84,6 +84,9 @@ object AutomationEngine {
 
     private val DYNAMIC_FIELDS = setOf("email", "confirmemail", "phone", "confirmphone", "username", "otp", "country", "countrycode", "dob", "dobyear", "dobmonth", "dobday")
 
+    // Picker-style controls that must always be recorded as Field steps, never as ClickNext.
+    private val FORCE_FIELD_TYPES = setOf("country", "countrycode", "currency", "state", "dob", "dobyear", "dobmonth", "dobday")
+
     private var currentWebView: WeakReference<WebView>? = null
     private var scannerJs: String? = null
     private var appContext: Context? = null
@@ -221,7 +224,7 @@ object AutomationEngine {
             startAutomation(config, navigateFirstCycle = false)
         } else if (hudMode == HudMode.Recording) {
             webView.postDelayed({
-                loadRecorder()?.let { js -> 
+                loadRecorder()?.let { js ->
                     webView.evaluateJavascript(js) { Log.d(TAG, "Recorder re-injected after attachWebView") }
                     val pauseJs = if (hudRecordingPaused) "try{ window.__automationRecorderPause(); }catch(_){}" else "try{ window.__automationRecorderResume(); }catch(_){}"
                     webView.evaluateJavascript(pauseJs, null)
@@ -241,7 +244,7 @@ object AutomationEngine {
 
     fun onPageFinished(webView: WebView) {
         if (hudMode == HudMode.Recording && hudRecordingPhase == RecordingPhase.Capturing) {
-            loadRecorder()?.let { js -> 
+            loadRecorder()?.let { js ->
                 webView.evaluateJavascript(js) { Log.d(TAG, "Recorder injected onPageFinished") }
                 val pauseJs = if (hudRecordingPaused) "try{ window.__automationRecorderPause(); }catch(_){}" else "try{ window.__automationRecorderResume(); }catch(_){}"
                 webView.evaluateJavascript(pauseJs, null)
@@ -544,8 +547,6 @@ object AutomationEngine {
                 const all = Array.from(document.querySelectorAll(SEL)).filter(visible);
                 let e = all.find(function(x) { return textMatches(x, true); }) || all.find(function(x) { return textMatches(x, false); });
                 if (e) return clickable(e);
-                // Custom country/date menus frequently render the label in a span
-                // while the event handler is delegated to its row or list item.
                 const loose = Array.from(document.querySelectorAll('div,span,li,p,[role=option],[data-value]')).filter(function(x) {
                     if (!visible(x)) return false;
                     const t = txt(x);
@@ -635,13 +636,37 @@ object AutomationEngine {
             function click(el) {
                 if (!el) return false;
                 try { el.scrollIntoView({block:'center'}); } catch (_) {}
+                try {
+                    const r = el.getBoundingClientRect();
+                    const w = el.ownerDocument.defaultView;
+                    const o = {bubbles:true, cancelable:true, clientX:r.left + r.width/2, clientY:r.top + r.height/2, button:0, view:w};
+                    try { el.dispatchEvent(new w.PointerEvent('pointerdown', o)); } catch (_) {}
+                    try { el.dispatchEvent(new w.MouseEvent('mousedown', o)); } catch (_) {}
+                    try { el.dispatchEvent(new w.PointerEvent('pointerup', o)); } catch (_) {}
+                    try { el.dispatchEvent(new w.MouseEvent('mouseup', o)); } catch (_) {}
+                } catch (_) {}
                 try { el.click(); return true; } catch (_) { return false; }
             }
-            function findOptions(doc) {
-                const selectors = '[role=option],[role=menuitem],li,button,[data-value],[data-country],.dropdown-item,.country-item,.year-item,.MuiMenuItem-root,.ant-select-item-option,.hwid-country-item,.hwid-country-list li';
-                try { return Array.from(doc.querySelectorAll(selectors)).filter(visible); } catch (_) { return []; }
-            }
             function normalize(s) { return String(s || '').trim().toLowerCase().replace(/[\s\u00a0]+/g,' '); }
+
+            // Option rows come in many shapes: li, div, span, with or without ARIA roles.
+            // Length filter (<=100 chars) skips big containers so a whole list is never matched as one option.
+            function findOptions(doc) {
+                const selectors = '[role=option],[role=menuitem],li,button,[data-value],[data-country],.dropdown-item,.country-item,.year-item,.MuiMenuItem-root,.ant-select-item-option,.hwid-country-item,.hwid-country-list li,div,span';
+                try {
+                    return Array.from(doc.querySelectorAll(selectors)).filter(function(o) {
+                        if (!visible(o)) return false;
+                        const t = text(o);
+                        return t.length > 0 && t.length <= 100;
+                    });
+                } catch (_) { return []; }
+            }
+            // Last group of digits in a string: "+853" -> "853", "中国澳门 853" -> "853", "India (+91)" -> "91".
+            // Using the LAST digit group means "+1" can never match "+1684".
+            function codeOf(s) {
+                const m = String(s || '').match(/\d+/g);
+                return m ? m[m.length - 1] : '';
+            }
             function optionMatches(el, wantedValue, type) {
                 const label = normalize(text(el));
                 const val = normalize(el.getAttribute('data-value') || el.getAttribute('data-country') || el.getAttribute('value') || '');
@@ -649,10 +674,20 @@ object AutomationEngine {
                 if (!target) return false;
                 if (label === target || val === target) return true;
                 if (type === 'countrycode') {
-                    const digits = target.replace(/[^+0-9]/g,'');
-                    return digits.length > 1 && (label.replace(/[^+0-9]/g,'') === digits || val.replace(/[^+0-9]/g,'') === digits);
+                    const want = target.replace(/\D/g, '');
+                    if (!want) return false;
+                    if (codeOf(label) === want || codeOf(val) === want) return true;
+                    return new RegExp('(?:^|\\D)' + want + '(?!\\d)').test(label);
                 }
                 return label.includes(target) || val.includes(target);
+            }
+            function scrollParent(n) {
+                for (; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+                    try {
+                        if (n.scrollHeight > n.clientHeight + 8 && /(auto|scroll)/.test(getComputedStyle(n).overflowY)) return n;
+                    } catch (_) {}
+                }
+                return null;
             }
             async function chooseCustom(el) {
                 // A selected-value span (Huawei ID) belongs to its clickable country row.
@@ -662,24 +697,30 @@ object AutomationEngine {
                 }
                 if (el.matches('.choose_value,[data-type=fydeos_select]')) trigger = el;
                 if (!click(trigger)) return {ok:false,err:'custom select trigger could not be clicked'};
-                await sleep(350);
+                await sleep(450);
                 const doc = el.ownerDocument;
-                let options = findOptions(doc);
-                // FydeOS year selector can render a plain list without option roles.
-                if (fieldType === 'dobyear' || el.matches('.choose_value,[data-type=fydeos_select]')) {
-                    const yearNodes = Array.from(doc.querySelectorAll('li,button,[role=option],div,span')).filter(visible)
-                        .filter(n => /^\d{4}$/.test(text(n)));
-                    options = options.concat(yearNodes);
+                const notTrigger = o => o !== trigger && !trigger.contains(o);
+
+                let found = null;
+                for (let i = 0; i < 15 && !found; i++) {
+                    let opts = findOptions(doc).filter(notTrigger);
+                    // FydeOS year selector can render a plain list without option roles.
+                    if (fieldType === 'dobyear' || el.matches('.choose_value,[data-type=fydeos_select]')) {
+                        const yearNodes = Array.from(doc.querySelectorAll('li,button,[role=option],div,span')).filter(visible)
+                            .filter(n => /^\d{4}${'$'}/.test(text(n)) && notTrigger(n));
+                        opts = opts.concat(yearNodes);
+                    }
+                    found = opts.find(o => optionMatches(o, wanted, fieldType));
+                    if (found) break;
+                    // Not in the visible part of the list: scroll it and look again.
+                    const sc = opts.length ? scrollParent(opts[opts.length - 1]) : null;
+                    if (!sc) break;
+                    const before = sc.scrollTop;
+                    sc.scrollTop += Math.max(200, sc.clientHeight * 0.8);
+                    await sleep(200);
+                    if (sc.scrollTop === before) break;   // reached the end of the list
                 }
-                // Huawei's list is often rendered in a portal elsewhere in the same document.
-                const found = options.find(o => optionMatches(o, wanted, fieldType));
-                if (found) { click(found); await sleep(250); return {ok:true}; }
-                // If the clicked span was nested, retry its closest obvious row/container.
-                const parent = trigger.parentElement;
-                if (parent) {
-                    const nested = findOptions(doc).find(o => optionMatches(o, wanted, fieldType));
-                    if (nested) { click(nested); await sleep(250); return {ok:true}; }
-                }
+                if (found) { click(found); await sleep(300); return {ok:true}; }
                 return {ok:false,err:'opened custom selector but no matching option found: '+wanted};
             }
             const started = Date.now();
@@ -689,12 +730,15 @@ object AutomationEngine {
             try {
                 const tag = (el.tagName || '').toLowerCase();
                 const type = (el.type || '').toLowerCase();
-                const isCustom = el.matches('button,[role=combobox],[aria-haspopup],.choose_value,[data-type=fydeos_select],#selectedCountry,.hwid-selectedCountryName,[id*=selectedCountry]') ||
-                    (tag !== 'input' && tag !== 'textarea' && tag !== 'select' && (el.getAttribute('role') === 'button' || el.hasAttribute('onclick')));
+                // Anything that is not a native text/select control is treated as a custom picker
+                // (Ctrip's "+86 v" is a plain div whose handler is attached by the framework).
+                const isNative = tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+                const isCustom = !isNative ||
+                    el.matches('button,[role=combobox],[aria-haspopup],.choose_value,[data-type=fydeos_select],#selectedCountry,.hwid-selectedCountryName,[id*=selectedCountry]');
                 if (isCustom) return JSON.stringify(await chooseCustom(el));
                 if (!wanted) return JSON.stringify({ok:false,err:'no data value available for this field: '+fieldType});
                 if (type === 'checkbox' || type === 'radio') {
-                    const want = !/^(false|0|no|off)$/i.test(wanted.trim());
+                    const want = !/^(false|0|no|off)${'$'}/i.test(wanted.trim());
                     if (el.checked !== want) el.click();
                     return JSON.stringify({ok:el.checked === want});
                 }
@@ -748,7 +792,7 @@ object AutomationEngine {
                 updateState(AutomationState.WAITING_DATA_EXHAUSTED)
                 return
             }
-            
+
             val defaultProfile = if (!config.defaultGroupName.isNullOrBlank() && !config.groupNames.contains(config.defaultGroupName)) {
                 VaultRepository.acquireMergedProfile(listOf(config.defaultGroupName), "default")
             } else activeProfile
@@ -1364,11 +1408,21 @@ object AutomationEngine {
         try {
             val obj = JSONObject(json)
             val kindRaw = obj.optString("kind", "Field")
-            val stepKind = when (kindRaw.lowercase()) {
-                "clicknext", "click", "button", "link", "submit", "anchor" -> StepKind.ClickNext
-                "wait" -> StepKind.Wait
-                "captchawait" -> StepKind.CaptchaWait
-                else -> StepKind.Field
+            val looksLike = sanitizeString(obj.optString("looksLike", ""), 50)
+
+            // Picker-style controls (country, country code, currency, state, DOB parts) are always Fields,
+            // even if the page reported them as a click. This prevents "Country/Region" becoming a Next button.
+            val forceField = FORCE_FIELD_TYPES.contains(looksLike.lowercase())
+
+            val stepKind = if (forceField) {
+                StepKind.Field
+            } else {
+                when (kindRaw.lowercase()) {
+                    "clicknext", "click", "button", "link", "submit", "anchor" -> StepKind.ClickNext
+                    "wait" -> StepKind.Wait
+                    "captchawait" -> StepKind.CaptchaWait
+                    else -> StepKind.Field
+                }
             }
             val cssSelector = sanitizeString(obj.optString("cssSelector", ""), 500)
             val xpathVal = sanitizeString(obj.optString("xpath", ""), 500)
@@ -1392,7 +1446,6 @@ object AutomationEngine {
             }
             lastRecordedAt = now
 
-            val looksLike = sanitizeString(obj.optString("looksLike", ""), 50)
             val canonicalType = if (stepKind == StepKind.Field) FieldTypeMapper.normalizeLooksLike(looksLike) else ""
             val rawLabel = if (stepKind == StepKind.ClickNext) obj.optString("buttonLabel", "Next button")
                            else FieldTypeMapper.fieldRowLabel(canonicalType, obj.optString("displayLabel", ""))

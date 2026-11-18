@@ -1,41 +1,24 @@
 /*
- * Automation Recorder v19
+ * Automation Recorder v21
  *
- * v18 on top of v17:
- *  - toasts appear ON the tapped element, not at the bottom of the screen
- *  - every captured tap carries a sequence number; Kotlin can acknowledge it, so the toast tells the truth
- *    ("Recorded #4" or "Not recorded: <reason>")
- *  - __automationRecorderDrain(): Kotlin can PULL queued events with evaluateJavascript, so recording no longer
- *    depends on window.AutomationBridge being visible to the page
+ * v21 on top of v20:
+ *  - FIX: "Country/Region" (and any country selector) is classified as "country", not "state"
+ *    (the word "region" used to win and the step became a ClickNext)
+ *  - FIX: "state" custom dropdowns are treated as fields too
+ *  - FIX: every silent drop now shows a grey toast with the reason, so "nothing detected" is diagnosable
  *
- * v17 on top of v16:
- *  - on-screen toasts show what the recorder is doing (green = captured, orange = bridge not ready, grey = tap had no
- *    recordable element), so you can see which layer fails without logcat
- *  - wider detection of custom widgets (country-code pickers, date pickers, MUI / Ant / react-select, aria-haspopup...)
- *  - keyboard is suppressed with inputmode=none BEFORE focus (no keyboard flash), restored on pause/stop
- *  - stopPropagation hook only acts on real (trusted) user events
- *
- * v16 on top of v15:
- *  - canary + watchdog: if anything erases our listeners (document.open, page scripts, bfcache restore) they are re-bound within 2s
- *  - taps that pages try to swallow with stopPropagation()/stopImmediatePropagation() are still recorded
- *  - text-field dedupe is time-limited (a field you tap again later is recorded again)
- *  - pointercancel / touchcancel are understood (scroll gestures never become taps)
- *  - health probe now includes counters (captured / ignored / rebinds)
- *
- * Fixes vs v14 (kept from v15):
- *  - NEVER touches document.head at install time (it is null at document-start; v14 threw there AFTER setting the
- *    "installed" flag, which left the recorder permanently dead on every page that loaded with the document-start script)
- *  - the "installed" flag is only set after listeners are really attached; a failed install is retried by the next injection
- *  - listeners are bound to window (capture) so pages cannot swallow taps before we see them
- *  - events are delivered to the native bridge IMMEDIATELY (survives instant navigation); the outbox only
- *    exists as a fallback when the bridge is not visible yet
- *  - links are NOT blocked any more: tapping a link records the step and the page navigates normally
+ * v18/v19/v20 features kept:
+ *  - toasts appear ON the tapped element, with sequence numbers acknowledged by Kotlin
+ *  - __automationRecorderDrain(): Kotlin pulls queued events with evaluateJavascript
+ *  - canary + watchdog re-binds listeners if a page erases them
+ *  - taps swallowed with stopPropagation() are still recorded
+ *  - keyboard suppressed with inputmode=none before focus
  *  - top frame only
  */
 (function () {
   "use strict";
   const g = globalThis;
-  const VERSION = "v20";
+  const VERSION = "v21";
   const DEBUG = true;
 
   function log() {
@@ -115,7 +98,7 @@
   }
   wrappedFocus.__ddgOrig = originalFocus;
 
-  // ---- helpers (unchanged from v13) ----
+  // ---- helpers ----
   function isVisible(el) {
     if (!el || !el.isConnected) return false;
     try {
@@ -226,8 +209,6 @@
 
   function localContext(el) {
     if (!el || !el.closest) return "";
-    // Prefer the nearest field wrapper; never concatenate the entire form/page,
-    // which caused unrelated controls to inherit the same field type.
     const selectors = [
       "label", "fieldset", "[role='group']", "[role='radiogroup']",
       "[data-field]", "[data-testid*='field' i]", "[class*='form-group' i]",
@@ -243,8 +224,6 @@
         }
       } catch (_) {}
     }
-    // Some legacy forms render the field caption as a preceding sibling.
-    // Read only nearby siblings; never concatenate the whole form/page.
     try {
       let node = el;
       for (let depth = 0; node && depth < 3; depth++, node = node.parentElement) {
@@ -255,8 +234,6 @@
         }
       }
     } catch (_) {}
-    // Portalled menus/dialogs are commonly rendered under document.body.
-    // Use only the nearest popup/listbox/dialog, not arbitrary ancestors.
     try {
       const popup = el.closest("[role='dialog'],[role='listbox'],[role='menu'],[aria-modal='true'],[data-radix-popper-content-wrapper],.MuiPopover-root,.MuiMenu-paper,.ant-select-dropdown,.react-select__menu");
       if (popup) return (popup.innerText || popup.textContent || "").replace(/\s+/g, " ").trim().slice(0, 500);
@@ -276,14 +253,11 @@
       el.getAttribute("data-type"), el.getAttribute("title"), el.getAttribute("class")
     ].filter(Boolean).join(" ").toLowerCase();
     const context = localContext(el).toLowerCase();
-    // Remembered picker context applies only to an option inside a popup.
-    // A global 15-second context incorrectly labels unrelated later fields.
     const popup = el.closest && el.closest("[role='listbox'],[role='menu'],[role='dialog'],[data-radix-popper-content-wrapper],.MuiPopover-root,.MuiMenu-paper,.ant-select-dropdown,.react-select__menu");
     const optionLike = role === "option" || role === "menuitem" || tag === "li" || !!(popup && el !== popup);
     const freshContext = optionLike && Date.now() - lastFieldContextAt < 15000 ? lastFieldContext : "";
     const c = (own + " " + context + " " + freshContext).replace(/\s+/g, " ").trim();
 
-    // Explicit custom controls seen in the supplied device captures.
     const ownText = (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim();
     if (el.id === "selectedCountry" || /hwid-selectedCountryName/i.test(own) || /selectedcountry/i.test(own)) return "country";
     if (el.getAttribute("data-type") === "fydeos_select" || /\bchoose_value\b/.test(own)) {
@@ -295,12 +269,17 @@
     const hasPhoneSibling = !!(el.parentElement && el.parentElement.querySelector("input[type='tel'],input[autocomplete^='tel'],input[name*='phone' i]"));
     if (role === "combobox" && /^\+\d{1,4}$/.test(ownText) && (/\b(phone|mobile|tel)\b/.test(context + " " + own) || hasPhoneSibling)) return "countryCode";
 
-    // Specific subfields must be checked before generic DOB/country rules.
     if (freshContext === "countryCode" ||
         /\b(country\s*(calling\s*)?code|calling\s*code|dial(?:ling)?\s*code|phone\s*code|international\s*prefix)\b/.test(c) ||
         /\b(iti__selected-flag|countrycode|country-code|dialcode|dial-code)\b/.test(own)) return "countryCode";
     if (/\b(currency|select currency|preferred currency|billing currency|payment currency)\b/.test(c) ||
         /\b(currency|curr|iso-4217)\b/.test(own)) return "currency";
+
+    // v21: a control whose OWN text says country/nation is a country selector.
+    // This MUST run before the generic "state|province|region" rule: the label
+    // "Country/Region" contains the word "region" and used to be classified as "state".
+    if (/\b(country|nation)\b/.test(own) && !/\b(code|prefix)\b/.test(own) &&
+        !/\b(date\s*of\s*birth|birth\s*date|birthday|dob)\b/.test(own)) return "country";
 
     const optionText = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
     const inheritedDob = /\b(dob|date of birth|birth date|birthday)\b/.test(freshContext);
@@ -356,7 +335,6 @@
     return false;
   }
 
-
   // ---- on-screen feedback: the badge sits on the tapped element ----
   let toastEl = null, toastTimer = null;
   function toast(msg, color, target) {
@@ -380,8 +358,8 @@
       try { r = target && target.getBoundingClientRect ? target.getBoundingClientRect() : null; } catch (_) {}
       let top, left;
       if (r && (r.width || r.height)) {
-        top = r.top - hgt + 4;                       // sits on the top edge of the element
-        if (top < 6) top = r.top + 4;                // no room above: sit just inside the element
+        top = r.top - hgt + 4;
+        if (top < 6) top = r.top + 4;
         left = Math.max(6, Math.min(r.left + 6, window.innerWidth - w - 6));
       } else {
         top = window.innerHeight - 110;
@@ -434,16 +412,13 @@
   }
 
   function sendToBridge(item, targetEl) {
-    // WebView may expose the JavascriptInterface proxy even when its callback is
-    // not reliably delivered during navigation/document replacement. Queue every
-    // event and let AutomationEngine drain it through evaluateJavascript.
     if (S.outbox.length >= CFG.OUTBOX_MAX) {
       warn("outbox full, dropping oldest event");
       S.outbox.shift();
     }
     S.outbox.push(item);
     log("queued for native recorder (outbox=" + S.outbox.length + ")");
-    toast("Captured — saving…", "#D97706", targetEl);
+    toast("Captured \u2014 saving\u2026", "#D97706", targetEl);
   }
 
   // ---- target resolution (walks the composed path, so open shadow DOM works) ----
@@ -498,7 +473,6 @@
 
   function resolveTarget(path) {
     let actual = null;
-    // First prefer a real semantic control, including custom listbox options.
     for (let i = 0; i < path.length; i++) {
       const el = path[i];
       if (el === document.documentElement || el === document.body) break;
@@ -519,8 +493,6 @@
       } catch (_) {}
     }
 
-    // Custom controls often put the click handler on a wrapper while the user
-    // taps a nested span/svg. Walk upward and prefer the closest widget wrapper.
     if (!actual) {
       const n = Math.min(path.length, CFG.POINTER_SCAN_DEPTH + 3);
       for (let i = 0; i < n; i++) {
@@ -534,9 +506,6 @@
       }
     }
 
-    // Country lists and custom menus commonly use plain li/span nodes with
-    // delegated listeners on the row/list. Record a meaningful row rather
-    // than rejecting the tap as "Nothing recordable: span".
     if (!actual) {
       for (let i = 0; i < Math.min(path.length, 5); i++) {
         const el = path[i];
@@ -556,7 +525,6 @@
     }
     if (!actual) return null;
 
-    // A visual label next to a native checkbox/radio maps to its real control.
     if (actual.tagName !== "A" && actual.tagName !== "BUTTON") {
       const lab = actual.tagName === "LABEL" ? actual : (actual.closest ? actual.closest("label") : null);
       if (lab) {
@@ -567,7 +535,12 @@
     return actual;
   }
 
-  function ignore(msg) { S.ignored++; log(msg); }
+  // v21: every drop is now visible on screen (grey toast with the reason)
+  function ignore(msg, target) {
+    S.ignored++;
+    log(msg);
+    toast(msg.replace(/^IGNORED \(/, "Skipped ("), "#6B7280", target);
+  }
 
   function processEvent(e, src) {
     try {
@@ -577,14 +550,13 @@
       const path = pathOf(e);
       if (!path.length) { ignore("IGNORED (" + src + "): no target"); return; }
       for (let i = 0; i < path.length; i++) {
-        if (path[i].hasAttribute && path[i].hasAttribute("data-automation-hud")) { ignore("IGNORED (" + src + "): HUD tap"); return; }
+        if (path[i].hasAttribute && path[i].hasAttribute("data-automation-hud")) { S.ignored++; log("IGNORED (" + src + "): HUD tap"); return; }
       }
 
       const actual = resolveTarget(path);
-      if (!actual) { ignore("IGNORED (" + src + "): no interactive target, tapped " + describe(path[0])); toast("Nothing recordable: " + describe(path[0]), "#6B7280", path[0]); return; }
-      if (!isVisible(actual) && !isBoxy(actual)) { ignore("IGNORED (" + src + "): not visible " + describe(actual)); return; }
+      if (!actual) { ignore("IGNORED (" + src + "): no interactive target, tapped " + describe(path[0]), path[0]); return; }
+      if (!isVisible(actual) && !isBoxy(actual)) { ignore("IGNORED (" + src + "): not visible " + describe(actual), actual); return; }
 
-      // one tap = touchend + pointerup + click + focusin: record once
       const now = Date.now();
       if (actual === lastTarget && now - lastTime < (isTextField(actual) ? 1200 : 500)) { return; }
       lastTarget = actual;
@@ -600,11 +572,9 @@
         lastFieldContext = inferredType.indexOf("dob") === 0 ? "date of birth dob" : inferredType;
         lastFieldContextAt = Date.now();
       }
-      const datePartText = ((actual.innerText || actual.textContent || "") + " " +
-        (actual.getAttribute("aria-label") || "") + " " +
-        (typeof actual.className === "string" ? actual.className : "")).replace(/\s+/g, " ").trim();
       const isDatePart = ["dob", "dobYear", "dobMonth", "dobDay"].indexOf(inferredType) !== -1;
-      const isSemanticPicker = ["country", "countryCode", "currency"].indexOf(inferredType) !== -1;
+      // v21: "state" added so custom state/province dropdowns are Fields, not ClickNext
+      const isSemanticPicker = ["country", "countryCode", "currency", "state"].indexOf(inferredType) !== -1;
       const isFieldLike =
         tag === "textarea" || tag === "select" ||
         (tag === "input" && CLICK_INPUT_TYPES.indexOf(type) === -1) ||
@@ -663,16 +633,15 @@
       if (S.pending.size > 30) S.pending.delete(S.pending.keys().next().value);
       sendToBridge(payload, actual);
 
-      // keyboard is already suppressed through inputmode=none; make sure the field is not left focused
       if (isTextField(actual)) { try { actual.blur(); } catch (_) {} }
     } catch (err) {
       warn("processEvent failed:", err && err.message);
     }
   }
 
-  // ---- listeners (window + capture: we see the event before page code can swallow it) ----
-  const processed = new WeakSet();   // events we already handled (so the stopPropagation hook never double-processes)
-  const HANDLERS = {};               // type -> handler, used by the stopPropagation hook
+  // ---- listeners (window + capture) ----
+  const processed = new WeakSet();
+  const HANDLERS = {};
 
   function on(type, fn, opts) {
     window.addEventListener(type, fn, opts);
@@ -714,7 +683,6 @@
       }
     }), passiveCap);
 
-    // the browser took the gesture over for scrolling: never treat it as a tap
     on("pointercancel", function (e) { if (e.pointerType === "touch") tMoved = true; }, cap);
     on("touchcancel", function () { tT = 0; tMoved = false; }, passiveCap);
 
@@ -739,11 +707,9 @@
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) processEvent(e, "focusin");
     }), cap);
 
-    // last chance to hand queued events to Kotlin before the page goes away
     on("pagehide", function () { pump(); }, cap);
     on("pageshow", function (e) { if (e.persisted) verifyListeners("pageshow/bfcache"); }, cap);
 
-    // canary: lets the watchdog prove that our listeners are still attached
     on("__ddg_canary", function () { canaryHit = true; }, cap);
   }
 
@@ -752,7 +718,6 @@
     S.listeners.length = 0;
   }
 
-  // if anything erased our listeners (document.open(), page code, bfcache restore) bind them again
   function verifyListeners(reason) {
     if (!S.active) return;
     canaryHit = false;
@@ -766,7 +731,7 @@
     ensureStyle();
   }
 
-  // ---- pages that call stopPropagation()/stopImmediatePropagation() on a tap must not hide it from us ----
+  // ---- pages that call stopPropagation() on a tap must not hide it from us ----
   const evProto = Event.prototype;
   const origStop = evProto.stopPropagation;
   const origStopImm = evProto.stopImmediatePropagation;
@@ -822,12 +787,10 @@
     g.__automationRecorderPause = function () { S.isPaused = true; restoreKeyboard(); log("Recorder paused"); };
     g.__automationRecorderResume = function () { S.isPaused = false; log("Recorder resumed"); };
     g.__automationRecorderStop = stop;
-    // Kotlin can PULL queued events (works even when window.AutomationBridge is not visible to this page)
     g.__automationRecorderDrain = function () {
       if (!S.outbox.length) return "";
       return JSON.stringify(S.outbox.splice(0, S.outbox.length));
     };
-    // Kotlin acknowledges every event: the toast then shows what really happened
     g.__automationRecorderAck = function (seq, ok, msg) {
       const p = S.pending.get(seq);
       S.pending.delete(seq);
@@ -845,7 +808,6 @@
       });
     };
 
-    // flag is set ONLY now that everything above really worked
     g.__automationRecorderInstalled = true;
     log("Recorder " + VERSION + " installed readyState=" + document.readyState + " url=" + location.href);
   } catch (err) {
