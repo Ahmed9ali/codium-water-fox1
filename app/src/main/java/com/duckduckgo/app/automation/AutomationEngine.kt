@@ -649,37 +649,65 @@ object AutomationEngine {
             }
             function normalize(s) { return String(s || '').trim().toLowerCase().replace(/[\s\u00a0]+/g,' '); }
 
-            // Option rows come in many shapes: li, div, span, with or without ARIA roles.
-            // Length filter (<=100 chars) skips big containers so a whole list is never matched as one option.
+            // Option rows come in many shapes: li, div, span, a, with or without ARIA roles.
+            // Text length is capped so a whole list or section is never treated as one option.
             function findOptions(doc) {
-                const selectors = '[role=option],[role=menuitem],li,button,[data-value],[data-country],.dropdown-item,.country-item,.year-item,.MuiMenuItem-root,.ant-select-item-option,.hwid-country-item,.hwid-country-list li,div,span';
+                const selectors = '[role=option],[role=menuitem],li,button,[data-value],[data-country],.dropdown-item,.country-item,.year-item,.MuiMenuItem-root,.ant-select-item-option,.hwid-country-item,.hwid-country-list li,div,span,a,p';
                 try {
                     return Array.from(doc.querySelectorAll(selectors)).filter(function(o) {
                         if (!visible(o)) return false;
                         const t = text(o);
-                        return t.length > 0 && t.length <= 100;
+                        return t.length > 0 && t.length <= 80;
                     });
                 } catch (_) { return []; }
             }
-            // Last group of digits in a string: "+853" -> "853", "中国澳门 853" -> "853", "India (+91)" -> "91".
-            // Using the LAST digit group means "+1" can never match "+1684".
+            // Last group of digits: "+853" -> "853", "中国澳门 853" -> "853", "India (+91)" -> "91".
             function codeOf(s) {
                 const m = String(s || '').match(/\d+/g);
                 return m ? m[m.length - 1] : '';
             }
-            function optionMatches(el, wantedValue, type) {
+            // 0 = exact, 1 = same dial code, 2 = partial text, -1 = no match
+            function matchTier(el, wantedValue, type) {
                 const label = normalize(text(el));
                 const val = normalize(el.getAttribute('data-value') || el.getAttribute('data-country') || el.getAttribute('value') || '');
                 const target = normalize(wantedValue);
-                if (!target) return false;
-                if (label === target || val === target) return true;
+                if (!target) return -1;
+                if (label === target || val === target) return 0;
                 if (type === 'countrycode') {
                     const want = target.replace(/\D/g, '');
-                    if (!want) return false;
-                    if (codeOf(label) === want || codeOf(val) === want) return true;
-                    return new RegExp('(?:^|\\D)' + want + '(?!\\d)').test(label);
+                    if (!want) return -1;
+                    const nums = label.match(/\d+/g) || [];
+                    // A real option row carries at most two numbers. A container holding many rows
+                    // (like a "hot countries" block) has many numbers and must never match.
+                    if (nums.length >= 1 && nums.length <= 2 && codeOf(label) === want) return 1;
+                    if (val && codeOf(val) === want) return 1;
+                    return -1;
                 }
-                return label.includes(target) || val.includes(target);
+                if (label.includes(target) || val.includes(target)) return 2;
+                return -1;
+            }
+            // Best tier first, then the SHORTEST text: a row beats the container that holds it.
+            function pickOption(opts) {
+                let best = null, bestTier = 9, bestLen = 1e9;
+                for (const o of opts) {
+                    const t = matchTier(o, wanted, fieldType);
+                    if (t < 0) continue;
+                    const len = text(o).length;
+                    if (t < bestTier || (t === bestTier && len < bestLen)) { best = o; bestTier = t; bestLen = len; }
+                }
+                return best;
+            }
+            // The clickable row that owns the matched text (the handler is often on the row, not the span).
+            function rowOf(el) {
+                let best = el, p = el;
+                for (let i = 0; i < 4 && p.parentElement; i++) {
+                    p = p.parentElement;
+                    const t = text(p);
+                    if (t.length > 80 || (t.match(/\d+/g) || []).length > 2) break;
+                    if (p.matches('li,[role=option],[role=menuitem],[data-value],[onclick],a,button')) { best = p; break; }
+                    try { if (getComputedStyle(p).cursor === 'pointer') best = p; } catch (_) {}
+                }
+                return best;
             }
             function scrollParent(n) {
                 for (; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
@@ -689,6 +717,15 @@ object AutomationEngine {
                 }
                 return null;
             }
+            // The selection really happened if the list closed / re-rendered or the trigger text changed.
+            function settled(trigger, found, before) {
+                try {
+                    if (!found.isConnected || !visible(found)) return true;
+                    const now = text(trigger);
+                    if (now && now !== before) return true;
+                } catch (_) { return true; }
+                return false;
+            }
             async function chooseCustom(el) {
                 // A selected-value span (Huawei ID) belongs to its clickable country row.
                 let trigger = el;
@@ -696,6 +733,11 @@ object AutomationEngine {
                     trigger = el.closest('[role=button],button,[onclick],.hwid-countryWidthFix,.hwid-selectedCountryName') || el;
                 }
                 if (el.matches('.choose_value,[data-type=fydeos_select]')) trigger = el;
+                const before = text(trigger);
+                const wantDigits = String(wanted).replace(/\D/g, '');
+                const already = fieldType === 'countrycode'
+                    ? (wantDigits !== '' && codeOf(before) === wantDigits)
+                    : (normalize(before) !== '' && normalize(before) === normalize(wanted));
                 if (!click(trigger)) return {ok:false,err:'custom select trigger could not be clicked'};
                 await sleep(450);
                 const doc = el.ownerDocument;
@@ -710,18 +752,29 @@ object AutomationEngine {
                             .filter(n => /^\d{4}${'$'}/.test(text(n)) && notTrigger(n));
                         opts = opts.concat(yearNodes);
                     }
-                    found = opts.find(o => optionMatches(o, wanted, fieldType));
+                    found = pickOption(opts);
                     if (found) break;
                     // Not in the visible part of the list: scroll it and look again.
                     const sc = opts.length ? scrollParent(opts[opts.length - 1]) : null;
                     if (!sc) break;
-                    const before = sc.scrollTop;
+                    const prevTop = sc.scrollTop;
                     sc.scrollTop += Math.max(200, sc.clientHeight * 0.8);
                     await sleep(200);
-                    if (sc.scrollTop === before) break;   // reached the end of the list
+                    if (sc.scrollTop === prevTop) break;   // reached the end of the list
                 }
-                if (found) { click(found); await sleep(300); return {ok:true}; }
-                return {ok:false,err:'opened custom selector but no matching option found: '+wanted};
+                if (!found) return {ok:false,err:'opened custom selector but no matching option found: '+wanted};
+
+                // Try the owning row first, then the matched element itself; verify after each click.
+                const tries = [];
+                [rowOf(found), found].forEach(function(x) { if (x && tries.indexOf(x) < 0) tries.push(x); });
+                for (const t of tries) {
+                    try { t.scrollIntoView({block:'center'}); } catch (_) {}
+                    await sleep(200);
+                    click(t);
+                    await sleep(500);
+                    if (already || settled(trigger, found, before)) return {ok:true};
+                }
+                return {ok:false,err:'clicked option <'+found.tagName.toLowerCase()+'> "'+text(found).slice(0,40)+'" but the selection did not change (trigger still "'+text(trigger).slice(0,20)+'")'};
             }
             const started = Date.now();
             let el = null;

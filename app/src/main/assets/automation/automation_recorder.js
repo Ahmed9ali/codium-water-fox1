@@ -1,5 +1,7 @@
 /*
- * Automation Recorder v21
+ * Automation Recorder v22
+ *
+ * v22: toasts render inside open <dialog>/top-layer modals (Zomato login), arrival counter + "ready" badge for diagnosis
  *
  * v21 on top of v20:
  *  - FIX: "Country/Region" (and any country selector) is classified as "country", not "state"
@@ -18,7 +20,7 @@
 (function () {
   "use strict";
   const g = globalThis;
-  const VERSION = "v21";
+  const VERSION = "v22";
   const DEBUG = true;
 
   function log() {
@@ -340,7 +342,8 @@
   function toast(msg, color, target) {
     if (!CFG.TOASTS) return;
     try {
-      const host = document.body || document.documentElement;
+      let host = document.body || document.documentElement;
+      try { const dlg = document.querySelector("dialog[open], [popover]:popover-open"); if (dlg) host = dlg; } catch (_) {}
       if (!host) return;
       if (toastEl && toastEl.parentNode) toastEl.parentNode.removeChild(toastEl);
       clearTimeout(toastTimer);
@@ -650,6 +653,7 @@
 
   function track(type, fn) {
     const h = function (e) {
+      if (type === "click" || type === "pointerup" || type === "touchend") S.seen = (S.seen || 0) + 1;
       if (processed.has(e)) return;
       processed.add(e);
       fn(e);
@@ -804,11 +808,12 @@
         listeners: S.listeners.length, outbox: S.outbox.length,
         bridge: !!(window.AutomationBridge && window.AutomationBridge.onElementRecorded),
         boundToThisDoc: S.doc === document, readyState: document.readyState, url: location.href,
-        captured: S.captured, ignored: S.ignored, rebinds: S.rebinds, lastBridgeError: S.lastBridgeError || "", pendingAcks: S.pending.size,
+        seen: S.seen || 0, captured: S.captured, ignored: S.ignored, rebinds: S.rebinds, lastBridgeError: S.lastBridgeError || "", pendingAcks: S.pending.size,
       });
     };
 
     g.__automationRecorderInstalled = true;
+    setTimeout(function () { toast("Recorder " + VERSION + " ready", "#2563EB", null); }, 400);
     log("Recorder " + VERSION + " installed readyState=" + document.readyState + " url=" + location.href);
   } catch (err) {
     warn("INSTALL FAILED, will retry on next injection:", err && err.message);
