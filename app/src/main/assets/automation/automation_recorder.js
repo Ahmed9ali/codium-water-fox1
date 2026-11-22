@@ -1,6 +1,9 @@
 /*
- * Automation Recorder v22
+ * Automation Recorder v23
  *
+ * v23: records inside iframes. The recorder now runs in every frame (document-start script), a child frame posts each
+ *      captured tap to the top page with postMessage, the top page queues it for Kotlin and sends the result back so the
+ *      toast appears inside the frame. Pause / resume / stop are relayed to all frames. Each step carries frameHost.
  * v22: toasts render inside open <dialog>/top-layer modals (Zomato login), arrival counter + "ready" badge for diagnosis
  *
  * v21 on top of v20:
@@ -20,7 +23,7 @@
 (function () {
   "use strict";
   const g = globalThis;
-  const VERSION = "v22";
+  const VERSION = "v23";
   const DEBUG = true;
 
   function log() {
@@ -31,7 +34,22 @@
     try { console.warn("WebConsole: " + Array.prototype.slice.call(arguments).join(" ")); } catch (_) {}
   }
 
-  try { if (window.top !== window) return; } catch (_) { return; }
+  // v23: the recorder also runs inside iframes. A child frame never talks to Kotlin itself: it posts to the top page.
+  let IS_TOP = true;
+  try { IS_TOP = window.top === window; } catch (_) { IS_TOP = false; }
+  function frameKey() { try { return location.hostname || location.protocol; } catch (_) { return ""; } }
+  function frameDepth() {
+    let d = 0, w = window;
+    try { while (w !== w.top && d < 10) { d++; w = w.parent; } } catch (_) {}
+    return d;
+  }
+  function relayCtl(cmd) {
+    try {
+      for (let i = 0; i < window.frames.length; i++) {
+        try { window.frames[i].postMessage({ __ddgRec: "ctl", cmd: cmd }, "*"); } catch (_) {}
+      }
+    } catch (_) {}
+  }
 
   const CFG = { TOASTS: true, OUTBOX_MAX: 200, PUMP_MS: 300, TAP_MAX_MS: 800, MOVE_PX: 30, POINTER_SCAN_DEPTH: 6 };
 
@@ -47,7 +65,7 @@
   const S = {
     version: VERSION, doc: document, active: false, isPaused: carriedPause,
     listeners: [], outbox: [], pumpTimer: null, watchdog: null, styleEl: null, onReady: null, stop: null,
-    captured: 0, ignored: 0, rebinds: 0, patched: false, seq: 0, pending: new Map(),
+    captured: 0, ignored: 0, rebinds: 0, frameCaptured: 0, patched: false, seq: 0, pending: new Map(),
   };
 
   let lastTarget = null;
@@ -415,6 +433,14 @@
   }
 
   function sendToBridge(item, targetEl) {
+    if (!IS_TOP) {
+      // child frame: hand the tap to the top page, which owns the queue Kotlin drains
+      try { window.top.postMessage({ __ddgRec: "cap", payload: item }, "*"); }
+      catch (e) { toast("\u26A0 cannot reach top page", "#DC2626", targetEl); return; }
+      log("sent to top page from frame " + frameKey());
+      toast("Captured \u2014 saving\u2026", "#D97706", targetEl);
+      return;
+    }
     if (S.outbox.length >= CFG.OUTBOX_MAX) {
       warn("outbox full, dropping oldest event");
       S.outbox.shift();
@@ -625,6 +651,9 @@
         cssSelector: getCssSelector(actual),
         xpath: getXPath(actual),
         looksLike: isFieldLike ? inferredType : "",
+        frameHost: IS_TOP ? "" : frameKey(),
+        frameDepth: IS_TOP ? 0 : frameDepth(),
+        frameUrl: IS_TOP ? "" : String(location.href).slice(0, 200),
         displayLabel: label || "Element",
         buttonLabel: kind === "ClickNext" ? (label || "Button") : "",
         verified: true,
@@ -660,6 +689,53 @@
     };
     HANDLERS[type] = h;
     return h;
+  }
+
+  // ---- iframe plumbing ----
+  function onFrameMessage(ev) {
+    const d = ev.data;
+    if (!d || typeof d !== "object" || d.__ddgRec === undefined) return;
+    try {
+      if (d.__ddgRec === "cap" && IS_TOP) {
+        // a child frame captured a tap
+        const src = ev.source;
+        const pl = d.payload;
+        if (!pl || typeof pl !== "object" || src === window) return;
+        const localId = pl.seq;
+        const reply = function (ok, msg) {
+          try { src.postMessage({ __ddgRec: "ack", localId: localId, ok: ok, msg: msg }, "*"); } catch (_) {}
+        };
+        if (!S.active) { reply(false, "recorder not active"); return; }
+        if (S.isPaused) { reply(false, "recording is paused"); return; }
+        pl.seq = ++S.seq;
+        S.pending.set(pl.seq, { src: src, localId: localId, label: pl.displayLabel || pl.tag || "" });
+        if (S.pending.size > 30) S.pending.delete(S.pending.keys().next().value);
+        if (S.outbox.length >= CFG.OUTBOX_MAX) S.outbox.shift();
+        S.outbox.push(pl);
+        S.captured++; S.frameCaptured++;
+        log("CAPTURED in frame " + (pl.frameHost || "?") + ": " + (pl.displayLabel || pl.tag));
+        return;
+      }
+      if (d.__ddgRec === "hello" && IS_TOP) {
+        const s2 = ev.source;
+        if (s2 && s2 !== window) s2.postMessage({ __ddgRec: "ctl", cmd: S.active ? (S.isPaused ? "pause" : "resume") : "stop" }, "*");
+        return;
+      }
+      if (!IS_TOP && (ev.source === window.parent || ev.source === window.top)) {
+        if (d.__ddgRec === "ack") {
+          const p = S.pending.get(d.localId);
+          S.pending.delete(d.localId);
+          const label = p ? p.label : "";
+          if (d.ok) toast("\u2713 Recorded " + (d.msg || "") + (label ? ": " + label : ""), "#10B981", p && p.el);
+          else toast("\u2717 Not recorded: " + d.msg, "#DC2626", p && p.el);
+        } else if (d.__ddgRec === "ctl") {
+          if (d.cmd === "pause") { S.isPaused = true; restoreKeyboard(); }
+          else if (d.cmd === "resume") S.isPaused = false;
+          else if (d.cmd === "stop") { relayCtl("stop"); stop(); return; }
+          relayCtl(d.cmd);
+        }
+      }
+    } catch (_) {}
   }
 
   let tX = 0, tY = 0, tT = 0, tMoved = false;
@@ -711,6 +787,7 @@
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) processEvent(e, "focusin");
     }), cap);
 
+    on("message", onFrameMessage, cap);
     on("pagehide", function () { pump(); }, cap);
     on("pageshow", function (e) { if (e.persisted) verifyListeners("pageshow/bfcache"); }, cap);
 
@@ -757,6 +834,7 @@
 
   // ---- lifecycle ----
   function stop() {
+    if (IS_TOP && S.active) relayCtl("stop");
     S.active = false;
     restoreKeyboard();
     unbindListeners();
@@ -788,8 +866,8 @@
     g.__ddgRecorderState = S;
     S.watchdog = setInterval(function () { verifyListeners("watchdog"); }, 2000);
 
-    g.__automationRecorderPause = function () { S.isPaused = true; restoreKeyboard(); log("Recorder paused"); };
-    g.__automationRecorderResume = function () { S.isPaused = false; log("Recorder resumed"); };
+    g.__automationRecorderPause = function () { S.isPaused = true; restoreKeyboard(); relayCtl("pause"); log("Recorder paused"); };
+    g.__automationRecorderResume = function () { S.isPaused = false; relayCtl("resume"); log("Recorder resumed"); };
     g.__automationRecorderStop = stop;
     g.__automationRecorderDrain = function () {
       if (!S.outbox.length) return "";
@@ -799,6 +877,10 @@
       const p = S.pending.get(seq);
       S.pending.delete(seq);
       const label = p ? p.label : "";
+      if (p && p.src) {   // the tap came from a child frame: the toast must appear inside that frame
+        try { p.src.postMessage({ __ddgRec: "ack", localId: p.localId, ok: !!ok, msg: msg }, "*"); } catch (_) {}
+        return;
+      }
       if (ok) toast("\u2713 Recorded " + (msg || "") + (label ? ": " + label : ""), "#10B981", p && p.el);
       else toast("\u2717 Not recorded: " + msg, "#DC2626", p && p.el);
     };
@@ -808,12 +890,13 @@
         listeners: S.listeners.length, outbox: S.outbox.length,
         bridge: !!(window.AutomationBridge && window.AutomationBridge.onElementRecorded),
         boundToThisDoc: S.doc === document, readyState: document.readyState, url: location.href,
-        seen: S.seen || 0, captured: S.captured, ignored: S.ignored, rebinds: S.rebinds, lastBridgeError: S.lastBridgeError || "", pendingAcks: S.pending.size,
+        seen: S.seen || 0, captured: S.captured, fromFrames: S.frameCaptured, frames: (function () { try { return window.frames.length; } catch (_) { return -1; } })(), ignored: S.ignored, rebinds: S.rebinds, lastBridgeError: S.lastBridgeError || "", pendingAcks: S.pending.size,
       });
     };
 
     g.__automationRecorderInstalled = true;
-    setTimeout(function () { toast("Recorder " + VERSION + " ready", "#2563EB", null); }, 400);
+    setTimeout(function () { toast("Recorder " + VERSION + (IS_TOP ? "" : " (frame " + frameKey() + ")") + " ready", "#2563EB", null); }, 400);
+    if (!IS_TOP) { try { window.top.postMessage({ __ddgRec: "hello" }, "*"); } catch (_) {} }
     log("Recorder " + VERSION + " installed readyState=" + document.readyState + " url=" + location.href);
   } catch (err) {
     warn("INSTALL FAILED, will retry on next injection:", err && err.message);

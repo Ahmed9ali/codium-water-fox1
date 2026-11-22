@@ -4,8 +4,11 @@ import android.content.Context
 import android.content.Intent
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
+import android.view.InputDevice
+import android.view.MotionEvent
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebStorage
@@ -96,6 +99,8 @@ object AutomationEngine {
     private val asyncBridge = AutomationAsyncBridge()
     private val mainHandler = Handler(Looper.getMainLooper())
     private var recorderScriptHandler: ScriptHandler? = null
+    private var executorScriptHandler: ScriptHandler? = null
+    private var executorJs: String? = null
     private var lastRecordedAt = 0L
 
     @Volatile private var isInitialized = false
@@ -430,6 +435,7 @@ object AutomationEngine {
     fun stopAutomation() {
         Log.d(TAG, "stopAutomation")
         automationJob?.cancel()
+        removeExecutorScript()
         fireDialogContinuation?.cancel()
         fireDialogContinuation = null
         currentConfig = null
@@ -485,343 +491,152 @@ object AutomationEngine {
         return fallback?.resolveForField(looksLike, step.name, step.tag) ?: ""
     }
 
-    private fun buildClickJs(step: RecordedStep): String {
+    // ------------------------------------------------------------------------------------------------------------
+    // Step execution. The fill / click JavaScript now lives in assets/automation/automation_executor.js (window.__ddgExec).
+    // Kotlin only builds a small JSON parameter object, so the same code also runs inside iframes.
+    // ------------------------------------------------------------------------------------------------------------
+
+    // A step recorded inside an iframe keeps the frame hostname in front of its CSS selector: "@@frame:host@@css".
+    private const val FRAME_PREFIX = "@@frame:"
+    private const val FRAME_SUFFIX = "@@"
+
+    private fun frameHostOf(step: RecordedStep): String? {
+        val s = step.cssSelector
+        if (!s.startsWith(FRAME_PREFIX)) return null
+        val end = s.indexOf(FRAME_SUFFIX, FRAME_PREFIX.length)
+        if (end < 0) return null
+        return s.substring(FRAME_PREFIX.length, end).takeIf { it.isNotBlank() }
+    }
+
+    private fun plainCss(step: RecordedStep): String {
+        val s = step.cssSelector
+        if (!s.startsWith(FRAME_PREFIX)) return s
+        val end = s.indexOf(FRAME_SUFFIX, FRAME_PREFIX.length)
+        return if (end < 0) s else s.substring(end + FRAME_SUFFIX.length)
+    }
+
+    private fun fillParams(step: RecordedStep, value: String, humanize: Boolean): JSONObject {
+        val hints = listOf(step.placeholder, step.ariaLabel, step.displayLabel, step.fieldType)
+            .map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        return JSONObject().apply {
+            put("id", step.domId)
+            put("name", step.name)
+            put("css", plainCss(step))
+            put("xpath", step.xpath)
+            put("hints", JSONArray(hints))
+            put("wanted", value)
+            put("fieldType", step.fieldType.lowercase())
+            put("humanize", humanize)
+        }
+    }
+
+    private fun clickParams(step: RecordedStep): JSONObject {
         val labels = listOf(step.buttonLabel, step.displayLabel, step.ariaLabel)
             .map { it.trim() }
             .filter { it.isNotBlank() && !it.equals("Next button", ignoreCase = true) }
             .distinct()
-        return """
-        (async function() {
-            const id = ${JSONObject.quote(step.domId)}, nm = ${JSONObject.quote(step.name)},
-                  css = ${JSONObject.quote(step.cssSelector)}, xpath = ${JSONObject.quote(step.xpath)};
-            const labels = ${JSONArray(labels)}.map(function(s) { return String(s).toLowerCase().replace(/\s+/g, ' ').trim(); });
-            const SEL = 'a,button,input[type=submit],input[type=button],input[type=image],[role=button],[role=link],[role=menuitem],[role=menuitemradio],[role=option],[role=tab],[role=treeitem],[onclick],[aria-haspopup],[aria-expanded],[aria-controls],[tabindex]:not([tabindex="-1"]),summary,li';
-            function visible(el) {
-                if (!el || !el.isConnected) return false;
-                try {
-                    const st = getComputedStyle(el);
-                    if (st.display === 'none' || st.visibility === 'hidden') return false;
-                    const r = el.getBoundingClientRect();
-                    return r.width > 0 && r.height > 0;
-                } catch (_) { return false; }
-            }
-            function txt(el) { return ((el.innerText || el.textContent || el.value || '') + '').replace(/\s+/g, ' ').trim().toLowerCase(); }
-            function attr(el, a) { return (el.getAttribute(a) || '').toLowerCase().trim(); }
-            function textMatches(el, exact) {
-                const t = txt(el), a = attr(el, 'aria-label'), ti = attr(el, 'title');
-                return labels.some(function(l) {
-                    return exact ? (t === l || a === l || ti === l) : (t.includes(l) || a.includes(l) || ti.includes(l));
-                });
-            }
-            function clickable(el) {
-                if (!el) return el;
-                const direct = el.closest && el.closest(SEL);
-                if (direct && direct !== document.body && direct !== document.documentElement) return direct;
-                let p = el;
-                for (let i = 0; p && i < 5; i++, p = p.parentElement) {
-                    if (!p || p === document.body || p === document.documentElement) break;
-                    let role = attr(p, 'role'), cls = attr(p, 'class');
-                    let st; try { st = getComputedStyle(p); } catch (_) {}
-                    if (/option|menuitem|treeitem|tab|button|link/.test(role) ||
-                        p.hasAttribute('onclick') || p.hasAttribute('aria-haspopup') ||
-                        p.hasAttribute('aria-expanded') || p.hasAttribute('data-value') ||
-                        (st && st.cursor === 'pointer') ||
-                        /country|region|dropdown|select|option|picker|calendar|date|year/.test(cls)) return p;
-                }
-                return el;
-            }
-            function bySelectors() {
-                const tries = [
-                    ['id', function() { return id ? document.getElementById(id) : null; }],
-                    ['css', function() { return css ? document.querySelector(css) : null; }],
-                    ['xpath', function() { return xpath ? document.evaluate(xpath, document, null, 9, null).singleNodeValue : null; }],
-                    ['name', function() { return nm ? document.getElementsByName(nm)[0] : null; }]
-                ];
-                for (const t of tries) {
-                    try { const e = t[1](); if (e && visible(e)) return {el: e, via: t[0]}; } catch (_) {}
-                }
-                return null;
-            }
-            function byText() {
-                if (!labels.length) return null;
-                const all = Array.from(document.querySelectorAll(SEL)).filter(visible);
-                let e = all.find(function(x) { return textMatches(x, true); }) || all.find(function(x) { return textMatches(x, false); });
-                if (e) return clickable(e);
-                const loose = Array.from(document.querySelectorAll('div,span,li,p,[role=option],[data-value]')).filter(function(x) {
-                    if (!visible(x)) return false;
-                    const t = txt(x);
-                    return t.length > 0 && t.length <= 120 && textMatches(x, true);
-                });
-                if (loose.length) return clickable(loose[0]);
-                return null;
-            }
-            function find() {
-                const s = bySelectors(), t = byText();
-                if (s) {
-                    if (!labels.length || !txt(s.el) || textMatches(s.el, false)) return {el: clickable(s.el), via: s.via};
-                    if (t) return {el: t, via: 'text'};
-                    return {el: clickable(s.el), via: s.via + '?'};
-                }
-                return t ? {el: t, via: 'text'} : null;
-            }
-            const start = Date.now();
-            let hit = null;
-            while (Date.now() - start < 10000) {
-                hit = find();
-                if (hit) break;
-                await new Promise(function(r) { setTimeout(r, 300); });
-            }
-            if (!hit) {
-                const shown = Array.from(document.querySelectorAll('a,button')).filter(visible).slice(0, 10).map(function(x) { return txt(x).slice(0, 25); });
-                return JSON.stringify({ok: false, err: 'click target not found. labels=' + JSON.stringify(labels) +
-                    ' selectors(id/css/xpath/name)=' + [!!id, !!css, !!xpath, !!nm].join('/') +
-                    ' visible a/button=' + JSON.stringify(shown)});
-            }
-            const el = hit.el;
-            try {
-                el.scrollIntoView({block: 'center'});
-                await new Promise(function(r) { setTimeout(r, 250); });
-                if (el.tagName === 'A' && el.target === '_blank') el.target = '_self';
-                const r = el.getBoundingClientRect();
-                const o = {bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0, view: window};
-                window.__ddgNavMark = true;
-                try { el.focus(); } catch (_) {}
-                try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (_) {}
-                el.dispatchEvent(new MouseEvent('mousedown', o));
-                try { el.dispatchEvent(new PointerEvent('pointerup', o)); } catch (_) {}
-                el.dispatchEvent(new MouseEvent('mouseup', o));
-                el.click();
-                return JSON.stringify({ok: true, via: hit.via});
-            } catch (e) { return JSON.stringify({ok: false, err: 'click error: ' + e.message}); }
-        })()
-        """.trimIndent()
+        return JSONObject().apply {
+            put("id", step.domId)
+            put("name", step.name)
+            put("css", plainCss(step))
+            put("xpath", step.xpath)
+            put("labels", JSONArray(labels))
+        }
     }
 
-    private fun buildFillJs(step: RecordedStep, value: String, humanize: Boolean): String {
-        val hints = listOf(step.placeholder, step.ariaLabel, step.displayLabel, step.fieldType)
-            .map { it.trim() }.filter { it.isNotBlank() }.distinct()
-        return """
-        (async function() {
-            const id = ${JSONObject.quote(step.domId)}, nm = ${JSONObject.quote(step.name)},
-                  css = ${JSONObject.quote(step.cssSelector)}, xpath = ${JSONObject.quote(step.xpath)};
-            const hints = ${JSONArray(hints)}.map(s => String(s).toLowerCase());
-            const wanted = ${JSONObject.quote(value)};
-            const fieldType = ${JSONObject.quote(step.fieldType.lowercase())};
-            const humanize = ${if (humanize) "true" else "false"};
-            const sleep = ms => new Promise(r => setTimeout(r, ms));
-            const text = el => String(el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim();
-            const visible = el => {
-                if (!el || !el.isConnected) return false;
-                try { const st = el.ownerDocument.defaultView.getComputedStyle(el), r = el.getBoundingClientRect();
-                    return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity) !== 0 && r.width > 0 && r.height > 0;
-                } catch (_) { return false; }
-            };
-            const dispatch = (el, type) => { const w = el.ownerDocument.defaultView; el.dispatchEvent(new w.Event(type, {bubbles:true, composed:true})); };
-            function findElement() {
-                const doc = document;
-                const tries = [
-                    () => id ? doc.getElementById(id) : null,
-                    () => css ? doc.querySelector(css) : null,
-                    () => xpath ? doc.evaluate(xpath, doc, null, 9, null).singleNodeValue : null,
-                    () => nm ? doc.getElementsByName(nm)[0] : null
-                ];
-                for (const fn of tries) { try { const el = fn(); if (visible(el)) return el; } catch (_) {} }
-                const all = Array.from(doc.querySelectorAll('input:not([type=hidden]),textarea,select,button,[role=combobox],[aria-haspopup],.choose_value,#selectedCountry,.hwid-selectedCountryName,[id*=selectedCountry]')).filter(visible);
-                for (const hint of hints) {
-                    const found = all.find(el => ((el.name || '')+' '+(el.id || '')+' '+(el.getAttribute('placeholder') || '')+' '+(el.getAttribute('aria-label') || '')+' '+text(el)).toLowerCase().includes(hint));
-                    if (found) return found;
-                }
-                return null;
-            }
-            function click(el) {
-                if (!el) return false;
-                try { el.scrollIntoView({block:'center'}); } catch (_) {}
-                try {
-                    const r = el.getBoundingClientRect();
-                    const w = el.ownerDocument.defaultView;
-                    const o = {bubbles:true, cancelable:true, clientX:r.left + r.width/2, clientY:r.top + r.height/2, button:0, view:w};
-                    try { el.dispatchEvent(new w.PointerEvent('pointerdown', o)); } catch (_) {}
-                    try { el.dispatchEvent(new w.MouseEvent('mousedown', o)); } catch (_) {}
-                    try { el.dispatchEvent(new w.PointerEvent('pointerup', o)); } catch (_) {}
-                    try { el.dispatchEvent(new w.MouseEvent('mouseup', o)); } catch (_) {}
-                } catch (_) {}
-                try { el.click(); return true; } catch (_) { return false; }
-            }
-            function normalize(s) { return String(s || '').trim().toLowerCase().replace(/[\s\u00a0]+/g,' '); }
+    private fun loadExecutor(): String? = executorJs ?: try {
+        appContext?.assets?.open("automation/automation_executor.js")?.bufferedReader()?.use { it.readText() }?.also { executorJs = it }
+    } catch (e: Exception) { null }
 
-            // Option rows come in many shapes: li, div, span, a, with or without ARIA roles.
-            // Text length is capped so a whole list or section is never treated as one option.
-            function findOptions(doc) {
-                const selectors = '[role=option],[role=menuitem],li,button,[data-value],[data-country],.dropdown-item,.country-item,.year-item,.MuiMenuItem-root,.ant-select-item-option,.hwid-country-item,.hwid-country-list li,div,span,a,p';
-                try {
-                    return Array.from(doc.querySelectorAll(selectors)).filter(function(o) {
-                        if (!visible(o)) return false;
-                        const t = text(o);
-                        return t.length > 0 && t.length <= 80;
-                    });
-                } catch (_) { return []; }
+    /** Registers the executor as a document-start script, so it also exists inside iframes of every page load. */
+    private fun installExecutorScript(webView: WebView) {
+        val js = loadExecutor() ?: run {
+            Log.e(TAG, "automation_executor.js missing from assets/automation/")
+            return
+        }
+        removeExecutorScript()
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                executorScriptHandler = WebViewCompat.addDocumentStartJavaScript(webView, js, setOf("*"))
+                Log.d(TAG, "Executor registered as document-start script")
+            } else {
+                Log.w(TAG, "DOCUMENT_START_SCRIPT not supported; steps inside iframes cannot run")
             }
-            // Last group of digits: "+853" -> "853", "中国澳门 853" -> "853", "India (+91)" -> "91".
-            function codeOf(s) {
-                const m = String(s || '').match(/\d+/g);
-                return m ? m[m.length - 1] : '';
-            }
-            // 0 = exact, 1 = same dial code, 2 = partial text, -1 = no match
-            function matchTier(el, wantedValue, type) {
-                const label = normalize(text(el));
-                const val = normalize(el.getAttribute('data-value') || el.getAttribute('data-country') || el.getAttribute('value') || '');
-                const target = normalize(wantedValue);
-                if (!target) return -1;
-                if (label === target || val === target) return 0;
-                if (type === 'countrycode') {
-                    const want = target.replace(/\D/g, '');
-                    if (!want) return -1;
-                    const nums = label.match(/\d+/g) || [];
-                    // A real option row carries at most two numbers. A container holding many rows
-                    // (like a "hot countries" block) has many numbers and must never match.
-                    if (nums.length >= 1 && nums.length <= 2 && codeOf(label) === want) return 1;
-                    if (val && codeOf(val) === want) return 1;
-                    return -1;
-                }
-                if (label.includes(target) || val.includes(target)) return 2;
-                return -1;
-            }
-            // Best tier first, then the SHORTEST text: a row beats the container that holds it.
-            function pickOption(opts) {
-                let best = null, bestTier = 9, bestLen = 1e9;
-                for (const o of opts) {
-                    const t = matchTier(o, wanted, fieldType);
-                    if (t < 0) continue;
-                    const len = text(o).length;
-                    if (t < bestTier || (t === bestTier && len < bestLen)) { best = o; bestTier = t; bestLen = len; }
-                }
-                return best;
-            }
-            // The clickable row that owns the matched text (the handler is often on the row, not the span).
-            function rowOf(el) {
-                let best = el, p = el;
-                for (let i = 0; i < 4 && p.parentElement; i++) {
-                    p = p.parentElement;
-                    const t = text(p);
-                    if (t.length > 80 || (t.match(/\d+/g) || []).length > 2) break;
-                    if (p.matches('li,[role=option],[role=menuitem],[data-value],[onclick],a,button')) { best = p; break; }
-                    try { if (getComputedStyle(p).cursor === 'pointer') best = p; } catch (_) {}
-                }
-                return best;
-            }
-            function scrollParent(n) {
-                for (; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
-                    try {
-                        if (n.scrollHeight > n.clientHeight + 8 && /(auto|scroll)/.test(getComputedStyle(n).overflowY)) return n;
-                    } catch (_) {}
-                }
-                return null;
-            }
-            // The selection really happened if the list closed / re-rendered or the trigger text changed.
-            function settled(trigger, found, before) {
-                try {
-                    if (!found.isConnected || !visible(found)) return true;
-                    const now = text(trigger);
-                    if (now && now !== before) return true;
-                } catch (_) { return true; }
-                return false;
-            }
-            async function chooseCustom(el) {
-                // A selected-value span (Huawei ID) belongs to its clickable country row.
-                let trigger = el;
-                if (el.id === 'selectedCountry' || el.matches('.hwid-selectedCountryName,[id*=selectedCountry]')) {
-                    trigger = el.closest('[role=button],button,[onclick],.hwid-countryWidthFix,.hwid-selectedCountryName') || el;
-                }
-                if (el.matches('.choose_value,[data-type=fydeos_select]')) trigger = el;
-                const before = text(trigger);
-                const wantDigits = String(wanted).replace(/\D/g, '');
-                const already = fieldType === 'countrycode'
-                    ? (wantDigits !== '' && codeOf(before) === wantDigits)
-                    : (normalize(before) !== '' && normalize(before) === normalize(wanted));
-                if (!click(trigger)) return {ok:false,err:'custom select trigger could not be clicked'};
-                await sleep(450);
-                const doc = el.ownerDocument;
-                const notTrigger = o => o !== trigger && !trigger.contains(o);
+        } catch (e: Exception) {
+            Log.e(TAG, "executor document-start registration failed: ${e.message}")
+        }
+    }
 
-                let found = null;
-                for (let i = 0; i < 15 && !found; i++) {
-                    let opts = findOptions(doc).filter(notTrigger);
-                    // FydeOS year selector can render a plain list without option roles.
-                    if (fieldType === 'dobyear' || el.matches('.choose_value,[data-type=fydeos_select]')) {
-                        const yearNodes = Array.from(doc.querySelectorAll('li,button,[role=option],div,span')).filter(visible)
-                            .filter(n => /^\d{4}${'$'}/.test(text(n)) && notTrigger(n));
-                        opts = opts.concat(yearNodes);
-                    }
-                    found = pickOption(opts);
-                    if (found) break;
-                    // Not in the visible part of the list: scroll it and look again.
-                    const sc = opts.length ? scrollParent(opts[opts.length - 1]) : null;
-                    if (!sc) break;
-                    const prevTop = sc.scrollTop;
-                    sc.scrollTop += Math.max(200, sc.clientHeight * 0.8);
-                    await sleep(200);
-                    if (sc.scrollTop === prevTop) break;   // reached the end of the list
-                }
-                if (!found) return {ok:false,err:'opened custom selector but no matching option found: '+wanted};
+    private fun removeExecutorScript() {
+        try { executorScriptHandler?.remove() } catch (_: Exception) {}
+        executorScriptHandler = null
+    }
 
-                // Try the owning row first, then the matched element itself; verify after each click.
-                const tries = [];
-                [rowOf(found), found].forEach(function(x) { if (x && tries.indexOf(x) < 0) tries.push(x); });
-                for (const t of tries) {
-                    try { t.scrollIntoView({block:'center'}); } catch (_) {}
-                    await sleep(200);
-                    click(t);
-                    await sleep(500);
-                    if (already || settled(trigger, found, before)) return {ok:true};
-                }
-                return {ok:false,err:'clicked option <'+found.tagName.toLowerCase()+'> "'+text(found).slice(0,40)+'" but the selection did not change (trigger still "'+text(trigger).slice(0,20)+'")'};
+    /** Makes sure window.__ddgExec exists in the top page (a new page load may have wiped it). */
+    private suspend fun ensureExecutor(webView: WebView) {
+        val state = evaluateJsSuspend(webView, "return window.__ddgExec ? 'ok' : 'missing';", 4_000L)
+        if (state.trim('"') == "ok") return
+        val js = loadExecutor() ?: run {
+            Log.e(TAG, "automation_executor.js missing from assets/automation/")
+            return
+        }
+        withContext(Dispatchers.Main) { webView.evaluateJavascript(js, null) }
+        delay(200)
+    }
+
+    private suspend fun execStep(webView: WebView, kind: String, params: JSONObject, frameHost: String?): JSONObject {
+        ensureExecutor(webView)
+        val body = "return await window.__ddgExec.run(${JSONObject.quote(kind)}, $params, ${JSONObject.quote(frameHost ?: "")});"
+        return safeJsonObject(evaluateJsSuspend(webView, body, 40_000L))
+    }
+
+    /**
+     * Sends a REAL touch (down + up) to the WebView at a position given in CSS pixels.
+     * Pages cannot tell it from a finger, so it works where dispatched JavaScript events are ignored.
+     */
+    private suspend fun nativeTap(webView: WebView, n: JSONObject): Boolean {
+        val density = webView.resources.displayMetrics.density.toDouble()
+        val dpr = n.optDouble("dpr", density).takeIf { it > 0.0 } ?: density
+        val scale = n.optDouble("vs", 1.0).takeIf { it > 0.0 } ?: 1.0
+        val x = ((n.optDouble("x") - n.optDouble("vx", 0.0)) * scale * dpr).toFloat()
+        val y = ((n.optDouble("y") - n.optDouble("vy", 0.0)) * scale * dpr).toFloat()
+        return withContext(Dispatchers.Main) {
+            if (x.isNaN() || y.isNaN() || x < 0f || y < 0f || x > webView.width || y > webView.height) {
+                Log.w(TAG, "nativeTap: ($x, $y) is outside the WebView (${webView.width}x${webView.height})")
+                false
+            } else {
+                Log.d(TAG, "nativeTap at ($x, $y) dpr=$dpr scale=$scale")
+                val downTime = SystemClock.uptimeMillis()
+                val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, y, 0)
+                down.source = InputDevice.SOURCE_TOUCHSCREEN
+                webView.dispatchTouchEvent(down)
+                down.recycle()
+                delay(80)
+                val up = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x, y, 0)
+                up.source = InputDevice.SOURCE_TOUCHSCREEN
+                webView.dispatchTouchEvent(up)
+                up.recycle()
+                true
             }
-            const started = Date.now();
-            let el = null;
-            while (Date.now() - started < 10000 && !el) { el = findElement(); if (!el) await sleep(250); }
-            if (!el) return JSON.stringify({ok:false,err:'field not found'});
-            try {
-                const tag = (el.tagName || '').toLowerCase();
-                const type = (el.type || '').toLowerCase();
-                // Anything that is not a native text/select control is treated as a custom picker
-                // (Ctrip's "+86 v" is a plain div whose handler is attached by the framework).
-                const isNative = tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
-                const isCustom = !isNative ||
-                    el.matches('button,[role=combobox],[aria-haspopup],.choose_value,[data-type=fydeos_select],#selectedCountry,.hwid-selectedCountryName,[id*=selectedCountry]');
-                if (isCustom) return JSON.stringify(await chooseCustom(el));
-                if (!wanted) return JSON.stringify({ok:false,err:'no data value available for this field: '+fieldType});
-                if (type === 'checkbox' || type === 'radio') {
-                    const want = !/^(false|0|no|off)${'$'}/i.test(wanted.trim());
-                    if (el.checked !== want) el.click();
-                    return JSON.stringify({ok:el.checked === want});
-                }
-                if (tag === 'select') {
-                    const target = normalize(wanted);
-                    const opt = Array.from(el.options).find(o => normalize(o.value) === target || normalize(o.textContent) === target) ||
-                        Array.from(el.options).find(o => normalize(o.textContent).includes(target));
-                    if (!opt) return JSON.stringify({ok:false,err:'no option matches '+wanted});
-                    el.value = opt.value; dispatch(el,'input'); dispatch(el,'change'); return JSON.stringify({ok:true});
-                }
-                if (tag !== 'input' && tag !== 'textarea') {
-                    if (el.isContentEditable) { el.textContent = wanted; dispatch(el,'input'); return JSON.stringify({ok:true}); }
-                    return JSON.stringify({ok:false,err:'unsupported field element '+tag});
-                }
-                const win = el.ownerDocument.defaultView;
-                const proto = tag === 'textarea' ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
-                const descriptor = Object.getOwnPropertyDescriptor(proto,'value');
-                const setter = descriptor && descriptor.set;
-                if (!setter) return JSON.stringify({ok:false,err:'native value setter unavailable'});
-                const setValue = v => setter.call(el,v);
-                setValue(''); dispatch(el,'input');
-                if (humanize) {
-                    let current = '';
-                    for (const ch of wanted) { current += ch; setValue(current); dispatch(el,'input'); await sleep(50 + Math.random()*80); }
-                } else { setValue(wanted); dispatch(el,'input'); }
-                dispatch(el,'change');
-                return JSON.stringify({ok:el.value === wanted,err:'value did not stick'});
-            } catch (e) { return JSON.stringify({ok:false,err:'fill error: '+(e && e.message || String(e))}); }
-        })()
-        """.trimIndent()
+        }
+    }
+
+    private suspend fun runFieldStep(webView: WebView, step: RecordedStep, value: String, humanize: Boolean): JSONObject {
+        val host = frameHostOf(step)
+        var res = execStep(webView, "fill", fillParams(step, value, humanize), host)
+        val nativeInfo = res.optJSONObject("native")
+        if (!res.optBoolean("ok", false) && nativeInfo != null) {
+            // The page ignored dispatched clicks: tap the option for real, then check that the field changed.
+            if (nativeTap(webView, nativeInfo)) {
+                delay(500)
+                val verdict = execStep(webView, "verify", JSONObject(), host)
+                res = if (verdict.optBoolean("ok", false)) verdict
+                else JSONObject().put("ok", false).put("err", verdict.optString("err").ifBlank { res.optString("err") })
+            } else {
+                res = JSONObject().put("ok", false).put("err", "option is outside the visible screen, could not tap it. " + res.optString("err"))
+            }
+        }
+        return res
     }
 
     private suspend fun runScriptExecution(
@@ -835,6 +650,9 @@ object AutomationEngine {
         }
         var completed = hudCompleted
         var isFirst = true
+        // Steps recorded inside an iframe need the executor inside that frame: register it, then reload once.
+        val needsFrames = script.steps.any { frameHostOf(it) != null }
+        installExecutorScript(webView)
         Log.d(TAG, "runScriptExecution: script=${script.name}, steps=${script.steps.size}, target=${config.targetRepeatCount}, navigateFirstCycle=$navigateFirstCycle")
 
         while (completed < config.targetRepeatCount && scope.isActive) {
@@ -852,9 +670,10 @@ object AutomationEngine {
 
             updateState(AutomationState.NAVIGATING)
             updateStatus("Loading ${script.url}...")
-            ensureOnUrl(webView, script.url, forceReload = !isFirst || navigateFirstCycle)
+            ensureOnUrl(webView, script.url, forceReload = !isFirst || navigateFirstCycle || needsFrames)
             isFirst = false
             waitForPageReady(webView)
+            ensureExecutor(webView)
 
             var lastError = ""
 
@@ -873,8 +692,7 @@ object AutomationEngine {
                         val valToFill = resolveFieldValue(step, activeProfile, defaultProfile)
                         if (config.humanize) delay(Random.nextLong(500, 3000))
 
-                        val raw = evaluateJsSuspend(webView, "return await ${buildFillJs(step, valToFill, config.humanize)};")
-                        val res = safeJsonObject(raw)
+                        val res = runFieldStep(webView, step, valToFill, config.humanize)
                         val ok = res.optBoolean("ok", false)
                         if (!ok) {
                             lastError = res.optString("err").ifBlank { "no result from page (timeout)" }
@@ -920,8 +738,7 @@ object AutomationEngine {
                         updateStatus("Clicking ${step.displayLabel}...")
                         if (config.humanize) delay(Random.nextLong(500, 3000))
 
-                        val raw = evaluateJsSuspend(webView, "return await ${buildClickJs(step)};")
-                        val res = safeJsonObject(raw)
+                        val res = execStep(webView, "click", clickParams(step), frameHostOf(step))
                         val ok = res.optBoolean("ok", false)
                         if (ok) {
                             Log.d(TAG, "ClickNext '${step.displayLabel}' succeeded via ${res.optString("via").ifBlank { "unknown" }}")
@@ -941,6 +758,7 @@ object AutomationEngine {
                     Log.e(TAG, "runScriptExecution: $msg")
                     updateStatus(msg)
                     updateState(AutomationState.ERROR)
+                    removeExecutorScript()
                     return
                 }
             }
@@ -955,6 +773,7 @@ object AutomationEngine {
 
         updateState(AutomationState.COMPLETED)
         updateStatus("Finished $completed / ${config.targetRepeatCount}")
+        removeExecutorScript()
         webView.evaluateJavascript("try { window.__automation_active = false; } catch(_) {}", null)
         onAutomationFinished?.invoke(completed)
     }
@@ -1346,8 +1165,24 @@ object AutomationEngine {
             if (hudMode == HudMode.Recording && hudRecordingPhase == RecordingPhase.Capturing) {
                 loadRecorder()?.let { webView.evaluateJavascript(it) { Log.d(TAG, "Recorder injected (delayed in startRecording)") } }
                 checkRecorderHealth(webView)
+                hintIfFrames(webView)
             }
         }, 600)
+    }
+
+    /**
+     * The recorder reaches iframes through the document-start script, which only applies to frames that load AFTER it is
+     * registered. If the page already shows a sizeable iframe, tell the person to reload once.
+     */
+    private fun hintIfFrames(webView: WebView) {
+        webView.evaluateJavascript(
+            "(function(){try{return Array.prototype.filter.call(document.querySelectorAll('iframe,frame'),function(f){var r=f.getBoundingClientRect();return r.width>80&&r.height>80;}).length;}catch(e){return 0;}})()"
+        ) { v ->
+            val n = v?.trim('"')?.toIntOrNull() ?: 0
+            if (n > 0 && hudMode == HudMode.Recording) {
+                Toast.makeText(appContext, "This page has $n embedded frame(s). Reload the page once so the recorder can attach inside them.", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     fun pauseRecording() {
@@ -1488,9 +1323,16 @@ object AutomationEngine {
                 return
             }
 
+            // A tap inside an iframe: remember the frame hostname in front of the selector (see FRAME_PREFIX).
+            val frameHost = sanitizeString(obj.optString("frameHost", ""), 120)
+            if (frameHost.isNotBlank() && obj.optInt("frameDepth", 1) > 1) {
+                Log.w(TAG, "step recorded in a nested frame (depth ${obj.optInt("frameDepth")}); replay supports one frame level only")
+            }
+            val storedCss = if (frameHost.isNotBlank()) "$FRAME_PREFIX$frameHost$FRAME_SUFFIX$cssSelector" else cssSelector
+
             val last = hudRecordedSteps.lastOrNull()
             val now = System.currentTimeMillis()
-            if (last != null && last.kind == stepKind && last.cssSelector == cssSelector &&
+            if (last != null && last.kind == stepKind && last.cssSelector == storedCss &&
                 last.xpath == xpathVal && now - lastRecordedAt < 600
             ) {
                 Log.d(TAG, "DROPPED tap: Ignoring duplicate recorder event (fast re-click)")
@@ -1514,7 +1356,7 @@ object AutomationEngine {
                 domId = domId,
                 placeholder = sanitizeString(obj.optString("placeholder"), 100),
                 ariaLabel = sanitizeString(obj.optString("ariaLabel"), 100),
-                cssSelector = cssSelector,
+                cssSelector = storedCss,
                 xpath = xpathVal,
                 index = obj.optInt("index", -1),
                 buttonLabel = sanitizeString(obj.optString("buttonLabel"), 100),
@@ -1522,7 +1364,7 @@ object AutomationEngine {
             )
             hudRecordedSteps = hudRecordedSteps + step
             Log.d(TAG, "Recorded step #${step.sequenceIndex} kind=$stepKind label=$displayLabel")
-            ackRecorder(seq, true, "#${step.sequenceIndex}")
+            ackRecorder(seq, true, "#${step.sequenceIndex}" + if (frameHost.isNotBlank()) " (in frame)" else "")
         } catch (e: Exception) {
             Log.e(TAG, "onRecorderElementCaptured parse fail: ${e.message}")
             ackRecorder(seq, false, "error: ${e.message}")
