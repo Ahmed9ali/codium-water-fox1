@@ -2,6 +2,7 @@ package com.duckduckgo.app.automation
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -91,6 +92,26 @@ object AutomationEngine {
     private val FORCE_FIELD_TYPES = setOf("country", "countrycode", "currency", "state", "dob", "dobyear", "dobmonth", "dobday")
 
     private var currentWebView: WeakReference<WebView>? = null
+    // Every WebView that was ever attached (one per tab). currentWebView can point at a background tab,
+    // so anything that must act on what the person is LOOKING at asks visibleWebView().
+    private val knownWebViews = mutableListOf<WeakReference<WebView>>()
+    private val webViewByTab = mutableMapOf<String, WeakReference<WebView>>()
+
+    private fun isReallyVisible(v: WebView): Boolean = try {
+        v.isAttachedToWindow && v.isShown && v.windowVisibility == android.view.View.VISIBLE &&
+            v.getGlobalVisibleRect(Rect()) && v.width > 0 && v.height > 0
+    } catch (_: Exception) { false }
+
+    private fun visibleWebView(): WebView? {
+        knownWebViews.removeAll { it.get() == null }
+        val cur = currentWebView?.get()
+        if (cur != null && isReallyVisible(cur)) return cur
+        val tabWv = activeTabId?.let { webViewByTab[it]?.get() }
+        if (tabWv != null && isReallyVisible(tabWv)) { currentWebView = WeakReference(tabWv); return tabWv }
+        val any = knownWebViews.mapNotNull { it.get() }.lastOrNull { isReallyVisible(it) }
+        if (any != null) { currentWebView = WeakReference(any); return any }
+        return cur ?: tabWv
+    }
     private var scannerJs: String? = null
     private var appContext: Context? = null
     private var automationJob: Job? = null
@@ -203,7 +224,9 @@ object AutomationEngine {
     fun attachWebView(webView: WebView, tabId: String? = null) {
         Log.d(TAG, "attachWebView tabId=$tabId")
         currentWebView = WeakReference(webView)
-        if (tabId != null) activeTabId = tabId
+        knownWebViews.removeAll { it.get() == null || it.get() === webView }
+        knownWebViews.add(WeakReference(webView))
+        if (tabId != null) { activeTabId = tabId; webViewByTab[tabId] = WeakReference(webView) }
 
         try {
             val bridge = AutomationBridge(
@@ -248,6 +271,8 @@ object AutomationEngine {
     }
 
     fun onPageFinished(webView: WebView) {
+        // the page that just finished loading in a visible WebView is the one the person is using
+        if (currentWebView?.get() !== webView && isReallyVisible(webView)) currentWebView = WeakReference(webView)
         if (hudMode == HudMode.Recording && hudRecordingPhase == RecordingPhase.Capturing) {
             loadRecorder()?.let { js ->
                 webView.evaluateJavascript(js) { Log.d(TAG, "Recorder injected onPageFinished") }
@@ -280,7 +305,7 @@ object AutomationEngine {
     }
 
     fun openScriptList() {
-        val host = currentWebView?.get()?.url?.let { AutomationScriptRepository.hostOfUrl(it) } ?: ""
+        val host = visibleWebView()?.url?.let { AutomationScriptRepository.hostOfUrl(it) } ?: ""
         hudAvailableScripts = AutomationScriptRepository.scriptsForHost(host)
         hudMode = HudMode.ScriptList
     }
@@ -1075,6 +1100,7 @@ object AutomationEngine {
             Toast.makeText(appContext, "Recording cancelled", Toast.LENGTH_SHORT).show()
         }
         activeTabId = tabId
+        webViewByTab[tabId]?.get()?.let { currentWebView = WeakReference(it) }
         _detectedFieldCount.postValue(0)
     }
 
@@ -1098,9 +1124,9 @@ object AutomationEngine {
     fun onOmnibarBotIconClicked() {
         when (hudMode) {
             HudMode.Recording -> return
-            HudMode.Running -> { currentWebView?.get()?.let { mountHudOverlayIfNeeded(it); hudVisible = true } }
+            HudMode.Running -> { visibleWebView()?.let { mountHudOverlayIfNeeded(it); hudVisible = true } }
             HudMode.Menu -> { hudMode = HudMode.Hidden; hudVisible = false }
-            HudMode.Hidden -> { currentWebView?.get()?.let { mountHudOverlayIfNeeded(it); hudMode = HudMode.Menu; hudVisible = true } }
+            HudMode.Hidden -> { visibleWebView()?.let { mountHudOverlayIfNeeded(it); hudMode = HudMode.Menu; hudVisible = true } }
             else -> { hudMode = HudMode.Hidden; hudVisible = false }
         }
     }
@@ -1144,7 +1170,7 @@ object AutomationEngine {
             currentWebView?.get()?.evaluateJavascript("try{ window.__automationRecorderResume(); }catch(_){}", null)
             return
         }
-        val webView = currentWebView?.get() ?: run {
+        val webView = visibleWebView() ?: run {
             Log.e(TAG, "startRecording: Failed, currentWebView is null")
             return
         }
@@ -1165,22 +1191,23 @@ object AutomationEngine {
             if (hudMode == HudMode.Recording && hudRecordingPhase == RecordingPhase.Capturing) {
                 loadRecorder()?.let { webView.evaluateJavascript(it) { Log.d(TAG, "Recorder injected (delayed in startRecording)") } }
                 checkRecorderHealth(webView)
-                hintIfFrames(webView)
+                reloadFramesForRecorder(webView)
             }
         }, 600)
     }
 
     /**
      * The recorder reaches iframes through the document-start script, which only applies to frames that load AFTER it is
-     * registered. If the page already shows a sizeable iframe, tell the person to reload once.
+     * registered. Instead of asking for a full page reload (which would close a login modal), reload only the visible
+     * http(s) iframes; the page itself and its modal state stay as they are.
      */
-    private fun hintIfFrames(webView: WebView) {
+    private fun reloadFramesForRecorder(webView: WebView) {
         webView.evaluateJavascript(
-            "(function(){try{return Array.prototype.filter.call(document.querySelectorAll('iframe,frame'),function(f){var r=f.getBoundingClientRect();return r.width>80&&r.height>80;}).length;}catch(e){return 0;}})()"
+            "(function(){var n=0;try{var fs=document.querySelectorAll('iframe');for(var i=0;i<fs.length;i++){var f=fs[i];var r=f.getBoundingClientRect();var s=f.getAttribute('src')||'';if(r.width>80&&r.height>80&&/^(https?:)?\\/\\//i.test(s)){f.src=f.src;n++;}}}catch(e){}return n;})()"
         ) { v ->
             val n = v?.trim('"')?.toIntOrNull() ?: 0
             if (n > 0 && hudMode == HudMode.Recording) {
-                Toast.makeText(appContext, "This page has $n embedded frame(s). Reload the page once so the recorder can attach inside them.", Toast.LENGTH_LONG).show()
+                Toast.makeText(appContext, "Attaching to $n embedded frame(s)...", Toast.LENGTH_SHORT).show()
             }
         }
     }

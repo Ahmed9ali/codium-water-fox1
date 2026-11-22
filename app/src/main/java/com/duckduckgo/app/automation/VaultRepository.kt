@@ -140,9 +140,10 @@ object VaultRepository {
                 }
             }
         if (newEntries.isEmpty()) return
+        val fixedEntries = newEntries.map { repairEntry(it) }
 
         groups.value = groups.value.map { g ->
-            if (g.name == groupName) g.copy(entries = g.entries + newEntries) else g
+            if (g.name == groupName) g.copy(entries = g.entries + fixedEntries) else g
         }
         save()
     }
@@ -153,7 +154,7 @@ object VaultRepository {
             if (g.name != groupName) return@map g
             val updated = g.entries.toMutableList()
             if (index in updated.indices) {
-                updated[index] = updated[index].copy(fieldType = normalizedType, value = newValue)
+                updated[index] = repairEntry(updated[index].copy(fieldType = normalizedType, value = newValue))
             }
             g.copy(entries = updated)
         }
@@ -257,7 +258,7 @@ object VaultRepository {
         val group = getGroup(groupName) ?: return 0
         val unused = group.entries.filter { !it.used }
         if (unused.isEmpty()) return 0
-        val countsByType = unused.groupingBy { normalizeFieldKey(it.fieldType) }.eachCount()
+        val countsByType = unused.groupingBy { effectiveType(it) }.eachCount()
         return countsByType.values.maxOrNull() ?: 0
     }
 
@@ -278,7 +279,7 @@ object VaultRepository {
 
             val byType = linkedMapOf<String, MutableList<Pair<Int, VaultEntry>>>()
             for (pair in indexedUnused) {
-                val key = normalizeFieldKey(pair.second.fieldType)
+                val key = effectiveType(pair.second)
                 byType.getOrPut(key) { mutableListOf() }.add(pair)
             }
 
@@ -316,6 +317,20 @@ object VaultRepository {
         }
 
         return ActiveAutomationProfile(consumed, chosenFields)
+    }
+
+    // "+216", "+91", "+ 60": a bare dial code. It was sometimes stored as EMAIL/TEXT/OTP by the single-token guesser.
+    private val DIAL_CODE = Regex("^\\+\\s*\\d{1,4}$")
+
+    /** Field type to use for this entry: a value that is just a "+<digits>" dial code is always a country code. */
+    fun effectiveType(entry: VaultEntry): String {
+        val key = normalizeFieldKey(entry.fieldType)
+        return if (DIAL_CODE.matches(entry.value.trim()) && key != "countrycode") "countrycode" else key
+    }
+
+    private fun repairEntry(e: VaultEntry): VaultEntry {
+        val t = effectiveType(e)
+        return if (t == "countrycode" && normalizeFieldKey(e.fieldType) != "countrycode") e.copy(fieldType = "countrycode") else e
     }
 
     fun normalizeFieldKey(raw: String): String {
@@ -385,7 +400,7 @@ object VaultRepository {
             val detectedType = if (hasSpecificGroupHint) hintedType else SmartParser.classifySingleToken(line)
             result.add(VaultEntry(fieldType = detectedType, value = line, used = false))
         }
-        return result
+        return result.map { repairEntry(it) }
     }
 
     private fun save() {
@@ -418,11 +433,11 @@ object VaultRepository {
                 val entriesJson = groupJson.getJSONArray("entries")
                 val entries = (0 until entriesJson.length()).map { j ->
                     val entryJson = entriesJson.getJSONObject(j)
-                    VaultEntry(
+                    repairEntry(VaultEntry(
                         fieldType = entryJson.getString("fieldType"),
                         value = entryJson.getString("value"),
                         used = entryJson.optBoolean("used", false),
-                    )
+                    ))
                 }
                 VaultGroup(
                     name = groupJson.getString("name"),

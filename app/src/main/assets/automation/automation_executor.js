@@ -186,6 +186,35 @@
     return !!loose && (c.indexOf(w) >= 0 || (c.length >= 3 && w.indexOf(c) >= 0));
   }
 
+  // ------------------------------------------------------------------ date parts (month / day / year lists)
+  // p.fieldType dobmonth|dobday|dobyear -> {kind, n}; accepts a full date, a month name, or a number.
+  function datePart(p) {
+    var ft = p.fieldType, w = String(p.wanted == null ? "" : p.wanted).trim();
+    if (ft !== "dobmonth" && ft !== "dobday" && ft !== "dobyear") return null;
+    var kind = ft === "dobmonth" ? "m" : ft === "dobday" ? "d" : "y";
+    var full = parseDate(w);
+    if (full && !/^\d{4}$/.test(w)) return { kind: kind, n: kind === "m" ? full.m : kind === "d" ? full.d : full.y };
+    var mi = MONTHS.indexOf(lower(w).slice(0, 3));
+    if (kind === "m" && mi >= 0 && /^[a-z]/i.test(w)) return { kind: kind, n: mi + 1 };
+    var num = parseInt(w.replace(/\D/g, ""), 10);
+    if (!(num >= 0)) return null;
+    if (kind === "y" && num < 100) num += num > 30 ? 1900 : 2000;
+    return { kind: kind, n: num };
+  }
+  // does one option string (already canonical) stand for this date part?
+  function datePartMatches(str, dp) {
+    str = lower(str).trim();
+    if (!str) return false;
+    if (dp.kind === "m") {
+      var mi = MONTHS.indexOf(str.slice(0, 3));
+      if (mi >= 0 && /^[a-z]/.test(str)) return mi + 1 === dp.n;
+      if (/^0?\d{1,2}$/.test(str)) return +str === dp.n;
+      return false;
+    }
+    if (dp.kind === "d") return /^0?\d{1,2}(st|nd|rd|th)?$/.test(str) && parseInt(str, 10) === dp.n;
+    return /^\d{2,4}$/.test(str) && (str.length === 4 ? +str === dp.n : (+str % 100) === (dp.n % 100));
+  }
+
   // ------------------------------------------------------------------ native <select>
   function optStrings(o) {
     var a = [o.label, o.text, o.textContent, o.value, o.getAttribute("data-name"), o.getAttribute("aria-label")];
@@ -196,6 +225,11 @@
   // 0 exact, 1 starts with, 2 contains, -1 none
   function selectTier(o, p) {
     var strs = optStrings(o), target = canon(p.wanted), best = -1;
+    var dp = datePart(p);
+    if (dp) {
+      for (var j = 0; j < strs.length; j++) if (datePartMatches(strs[j], dp)) return 0;
+      return -1;
+    }
     if (!target) return -1;
     var wd = target.replace(/\D/g, "");
     for (var i = 0; i < strs.length; i++) {
@@ -233,7 +267,7 @@
   }
   function fillSelect(el, p) {
     var hit = bestOption(el, p), via = "recorded select";
-    if (!hit) {
+    if (!hit && !datePart(p)) {
       // The recorded select may be a different one than the page uses now: look for a select that has the option.
       var others = deepAll("select").filter(function (s) { return s !== el && s.options.length > 1 && visible(s); });
       var hints = (p.hints || []).map(lower).filter(Boolean);
@@ -268,6 +302,8 @@
     var label = canon(text(el));
     var val = canon(el.getAttribute("data-value") || el.getAttribute("data-country") || el.getAttribute("value") || "");
     var target = canon(p.wanted);
+    var dp = datePart(p);
+    if (dp) return (datePartMatches(label, dp) || (val && datePartMatches(val, dp))) ? 0 : -1;
     if (!target) return -1;
     if (label === target || val === target) return 0;
     if (p.fieldType === "countrycode") {
@@ -422,6 +458,12 @@
         value = d.y + "-" + pad(d.m) + "-" + pad(d.d);
         if (type === "datetime-local") value += "T00:00";
         if (type === "month") value = d.y + "-" + pad(d.m);
+      } else if (datePart(p)) {
+        // a single month/day/year text box: write just that part
+        var dpt = datePart(p);
+        var padTo = el.maxLength === 2 || /^(mm|dd)$/i.test(el.getAttribute("placeholder") || "");
+        value = dpt.kind === "y" ? String(dpt.n) : (padTo ? pad(dpt.n) : String(dpt.n));
+        if (dpt.kind === "y" && el.maxLength === 2) value = String(dpt.n).slice(-2);
       } else if (isDob) {
         var pd = parseDate(wanted);
         var shaped = pd ? formatForPlaceholder(pd, el.getAttribute("placeholder") || "") : null;

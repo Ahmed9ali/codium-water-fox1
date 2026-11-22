@@ -1,5 +1,5 @@
 /*
- * Automation Recorder v23
+ * Automation Recorder v24
  *
  * v23: records inside iframes. The recorder now runs in every frame (document-start script), a child frame posts each
  *      captured tap to the top page with postMessage, the top page queues it for Kotlin and sends the result back so the
@@ -23,7 +23,7 @@
 (function () {
   "use strict";
   const g = globalThis;
-  const VERSION = "v23";
+  const VERSION = "v24";
   const DEBUG = true;
 
   function log() {
@@ -209,6 +209,12 @@
     if (!el) return "";
     let label = "";
     const type = (el.type || "").toLowerCase();
+    if (el.tagName === "SELECT") {
+      // v24: never use the option list as a label (it is every option's text).
+      let l = el.labels && el.labels.length ? (el.labels[0].innerText || el.labels[0].textContent) : "";
+      l = l || el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("name") || el.id || "";
+      return l.replace(/\s+/g, " ").trim().slice(0, 100);
+    }
     if (el.labels && el.labels.length) {
       label = el.labels[0].innerText || el.labels[0].textContent;
     } else if (el.closest && el.closest("label") && !(el.tagName === "A" || el.tagName === "BUTTON")) {
@@ -261,6 +267,63 @@
     return "";
   }
 
+  // ---- v24: structural date-part detection (month / day / year) ----
+  const MONTH_RX = /^(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|jun(e)?|jul(y)?|aug(ust)?|sep(t(ember)?)?|oct(ober)?|nov(ember)?|dec(ember)?)\b/i;
+  function optionTexts(sel) {
+    const out = [];
+    for (let i = 0; i < sel.options.length; i++) out.push((sel.options[i].text || "").replace(/\s+/g, " ").trim());
+    return out;
+  }
+  function selectShape(sel) {
+    if (!sel || sel.tagName !== "SELECT") return "";
+    const o = optionTexts(sel).filter(Boolean);
+    if (o.length < 10) return "";
+    const names = o.filter(function (t) { return MONTH_RX.test(t); }).length;
+    if (names >= 12) return "month";
+    const nums = o.filter(function (t) { return /^\d{1,4}$/.test(t); }).map(Number);
+    if (nums.length >= 10) {
+      const max = Math.max.apply(null, nums);
+      const min = Math.min.apply(null, nums);
+      if (max >= 1000 && min >= 1000) return "year";
+      if (max >= 28 && max <= 31 && min <= 1) return "day";
+      if (max === 12 && min <= 1) return "month";
+    }
+    return "";
+  }
+  function yearInputLike(el) {
+    if (!el || el.tagName !== "INPUT") return false;
+    const t = (el.type || "text").toLowerCase();
+    if (["text", "number", "tel", ""].indexOf(t) === -1) return false;
+    const h = [el.name, el.id, el.getAttribute("placeholder"), el.getAttribute("aria-label")].filter(Boolean).join(" ").toLowerCase();
+    return /\b(year|yyyy|yy)\b|year$|^year/.test(h) || el.maxLength === 4 && /\bd?o?b\b|birth|year/.test(h);
+  }
+  function datePartOf(el) {
+    let shape = "";
+    if (el.tagName === "SELECT") shape = selectShape(el);
+    else if (yearInputLike(el)) shape = "year";
+    if (!shape) return "";
+    let cur = el.parentElement;
+    for (let d = 0; cur && d < 5; d++, cur = cur.parentElement) {
+      const sels = cur.querySelectorAll("select,input");
+      if (sels.length > 12) break;
+      const shapes = [];
+      for (let i = 0; i < sels.length; i++) {
+        const sh = sels[i].tagName === "SELECT" ? selectShape(sels[i]) : (yearInputLike(sels[i]) ? "year" : "");
+        if (sh) shapes.push(sh);
+      }
+      const uniq = shapes.filter(function (v, i) { return shapes.indexOf(v) === i; });
+      if (uniq.length >= 2 && uniq.indexOf("month") !== -1) return shape;
+    }
+    return "";
+  }
+  function nearPhoneInput(el) {
+    let cur = el.parentElement;
+    for (let d = 0; cur && d < 4; d++, cur = cur.parentElement) {
+      if (cur.querySelector("input[type='tel'],input[autocomplete^='tel'],input[name*='phone' i],input[name*='mobile' i],input[placeholder*='phone' i],input[placeholder*='mobile' i]")) return true;
+    }
+    return false;
+  }
+
   function classify(el) {
     const tag = (el.tagName || "").toLowerCase();
     const type = (el.type || "").toLowerCase();
@@ -286,8 +349,13 @@
       if (/\b(day)\b/.test(context + " " + own)) return "dobDay";
       return "dob";
     }
+    const dpart = datePartOf(el);
+    if (dpart === "month") return "dobMonth";
+    if (dpart === "day") return "dobDay";
+    if (dpart === "year") return "dobYear";
     const hasPhoneSibling = !!(el.parentElement && el.parentElement.querySelector("input[type='tel'],input[autocomplete^='tel'],input[name*='phone' i]"));
     if (role === "combobox" && /^\+\d{1,4}$/.test(ownText) && (/\b(phone|mobile|tel)\b/.test(context + " " + own) || hasPhoneSibling)) return "countryCode";
+    if (/^\+\d{1,4}$/.test(ownText) && nearPhoneInput(el)) return "countryCode";
 
     if (freshContext === "countryCode" ||
         /\b(country\s*(calling\s*)?code|calling\s*code|dial(?:ling)?\s*code|phone\s*code|international\s*prefix)\b/.test(c) ||
