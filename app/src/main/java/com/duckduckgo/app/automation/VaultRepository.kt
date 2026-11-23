@@ -60,9 +60,9 @@ data class ActiveAutomationProfile(
             "confirmpassword" -> fields["password"]
             "confirmemail" -> fields["email"]
             "confirmphone" -> fields["phone"]
-            "dobyear" -> fields["birthyear"] ?: fields["yearofbirth"]
-            "dobmonth" -> fields["birthmonth"]
-            "dobday" -> fields["birthday"]
+            "dobyear" -> fields["birthyear"] ?: fields["yearofbirth"] ?: datePartOfDob(fields["dob"], 'y')
+            "dobmonth" -> fields["birthmonth"] ?: datePartOfDob(fields["dob"], 'm')
+            "dobday" -> fields["birthday"] ?: datePartOfDob(fields["dob"], 'd')
             "countrycode" -> fields["dialcode"] ?: fields["isdcode"] ?: fields["phonecode"]
             "firstname" -> fields["fullname"]?.trim()?.substringBefore(" ") ?: fields["username"]
             "middlename" -> null 
@@ -88,6 +88,26 @@ data class ActiveAutomationProfile(
             }
             else -> fields["text"]
         }
+    }
+}
+
+/** Day / month / year out of a stored "dob" value: a full date, or a bare number that already is that part. */
+internal fun datePartOfDob(raw: String?, part: Char): String? {
+    val v = raw?.trim().orEmpty()
+    if (v.isEmpty()) return null
+    Regex("^(\\d{4})[-/.](\\d{1,2})[-/.](\\d{1,2})$").matchEntire(v)?.let { m ->
+        return when (part) { 'y' -> m.groupValues[1]; 'm' -> m.groupValues[2].toInt().toString(); else -> m.groupValues[3].toInt().toString() }
+    }
+    Regex("^(\\d{1,2})[-/.](\\d{1,2})[-/.](\\d{4})$").matchEntire(v)?.let { m ->
+        val a = m.groupValues[1].toInt(); val b = m.groupValues[2].toInt()
+        val (d, mo) = if (b > 12) b to a else a to b   // dd/mm/yyyy unless the second number cannot be a month
+        return when (part) { 'y' -> m.groupValues[3]; 'm' -> mo.toString(); else -> d.toString() }
+    }
+    val n = v.toIntOrNull() ?: return null
+    return when (part) {
+        'y' -> if (v.length == 4 && n in 1900..2100) v else null
+        'm' -> if (n in 1..12) v else null
+        else -> if (n in 1..31) v else null
     }
 }
 
@@ -140,7 +160,7 @@ object VaultRepository {
                 }
             }
         if (newEntries.isEmpty()) return
-        val fixedEntries = newEntries.map { repairEntry(it) }
+        val fixedEntries = newEntries.map { repairEntry(it, groupName) }
 
         groups.value = groups.value.map { g ->
             if (g.name == groupName) g.copy(entries = g.entries + fixedEntries) else g
@@ -154,7 +174,7 @@ object VaultRepository {
             if (g.name != groupName) return@map g
             val updated = g.entries.toMutableList()
             if (index in updated.indices) {
-                updated[index] = repairEntry(updated[index].copy(fieldType = normalizedType, value = newValue))
+                updated[index] = repairEntry(updated[index].copy(fieldType = normalizedType, value = newValue), g.name)
             }
             g.copy(entries = updated)
         }
@@ -258,7 +278,7 @@ object VaultRepository {
         val group = getGroup(groupName) ?: return 0
         val unused = group.entries.filter { !it.used }
         if (unused.isEmpty()) return 0
-        val countsByType = unused.groupingBy { effectiveType(it) }.eachCount()
+        val countsByType = unused.groupingBy { effectiveType(it, group.name) }.eachCount()
         return countsByType.values.maxOrNull() ?: 0
     }
 
@@ -279,7 +299,7 @@ object VaultRepository {
 
             val byType = linkedMapOf<String, MutableList<Pair<Int, VaultEntry>>>()
             for (pair in indexedUnused) {
-                val key = effectiveType(pair.second)
+                val key = effectiveType(pair.second, group.name)
                 byType.getOrPut(key) { mutableListOf() }.add(pair)
             }
 
@@ -322,15 +342,44 @@ object VaultRepository {
     // "+216", "+91", "+ 60": a bare dial code. It was sometimes stored as EMAIL/TEXT/OTP by the single-token guesser.
     private val DIAL_CODE = Regex("^\\+\\s*\\d{1,4}$")
 
-    /** Field type to use for this entry: a value that is just a "+<digits>" dial code is always a country code. */
-    fun effectiveType(entry: VaultEntry): String {
+    private val DOB_TYPES = setOf("dob", "dobday", "dobmonth", "dobyear")
+    private val MONTH_NAME = Regex("^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?$", RegexOption.IGNORE_CASE)
+
+    /**
+     * Field type to use for this entry. The single-token guesser files bare numbers and dial codes under EMAIL/TEXT,
+     * so: a "+<digits>" value is a country code; inside a date-of-birth group a bare number is the day, month or
+     * year (judged by its size and by the group name); anything typed EMAIL without an "@" takes the group's type.
+     */
+    fun effectiveType(entry: VaultEntry, groupName: String = ""): String {
         val key = normalizeFieldKey(entry.fieldType)
-        return if (DIAL_CODE.matches(entry.value.trim()) && key != "countrycode") "countrycode" else key
+        val v = entry.value.trim()
+        if (DIAL_CODE.matches(v) && key != "countrycode") return "countrycode"
+        val gname = groupName.lowercase()
+        val ghint = if (groupName.isBlank()) "" else normalizeFieldKey(groupName)
+        val misTyped = (key == "email" && !v.contains("@")) || key == "text"
+        val dobish = key in DOB_TYPES || ghint in DOB_TYPES
+        if (dobish && (misTyped || key in DOB_TYPES)) {
+            val n = v.toIntOrNull()
+            when {
+                MONTH_NAME.matches(v) -> return "dobmonth"
+                n != null && v.length == 4 && n in 1900..2100 -> return "dobyear"
+                n != null && v.length <= 2 -> return when {
+                    "month" in gname -> "dobmonth"
+                    "year" in gname -> "dobyear"
+                    key == "dobmonth" || key == "dobyear" -> key
+                    n in 1..31 -> "dobday"
+                    else -> key
+                }
+            }
+        }
+        if (key == "email" && !v.contains("@") && ghint.isNotEmpty() && ghint != "text" && ghint != "email" &&
+            !ghint.startsWith("group") && !ghint.startsWith("form") && !ghint.startsWith("imported")) return ghint
+        return key
     }
 
-    private fun repairEntry(e: VaultEntry): VaultEntry {
-        val t = effectiveType(e)
-        return if (t == "countrycode" && normalizeFieldKey(e.fieldType) != "countrycode") e.copy(fieldType = "countrycode") else e
+    private fun repairEntry(e: VaultEntry, groupName: String = ""): VaultEntry {
+        val t = effectiveType(e, groupName)
+        return if (t != normalizeFieldKey(e.fieldType)) e.copy(fieldType = t) else e
     }
 
     fun normalizeFieldKey(raw: String): String {
@@ -400,7 +449,7 @@ object VaultRepository {
             val detectedType = if (hasSpecificGroupHint) hintedType else SmartParser.classifySingleToken(line)
             result.add(VaultEntry(fieldType = detectedType, value = line, used = false))
         }
-        return result.map { repairEntry(it) }
+        return result.map { repairEntry(it, groupHint) }
     }
 
     private fun save() {
@@ -433,15 +482,16 @@ object VaultRepository {
                 val entriesJson = groupJson.getJSONArray("entries")
                 val entries = (0 until entriesJson.length()).map { j ->
                     val entryJson = entriesJson.getJSONObject(j)
-                    repairEntry(VaultEntry(
+                    VaultEntry(
                         fieldType = entryJson.getString("fieldType"),
                         value = entryJson.getString("value"),
                         used = entryJson.optBoolean("used", false),
-                    ))
+                    )
                 }
+                val gName = groupJson.getString("name")
                 VaultGroup(
-                    name = groupJson.getString("name"),
-                    entries = entries,
+                    name = gName,
+                    entries = entries.map { repairEntry(it, gName) },
                     pinned = groupJson.optBoolean("pinned", false),
                     type = try { DataGroupType.valueOf(groupJson.optString("type", "RECURRING")) } catch (_: Exception) { DataGroupType.RECURRING }
                 )

@@ -1,5 +1,5 @@
 /*
- * Automation Recorder v24
+ * Automation Recorder v25
  *
  * v23: records inside iframes. The recorder now runs in every frame (document-start script), a child frame posts each
  *      captured tap to the top page with postMessage, the top page queues it for Kotlin and sends the result back so the
@@ -23,7 +23,7 @@
 (function () {
   "use strict";
   const g = globalThis;
-  const VERSION = "v24";
+  const VERSION = "v25";
   const DEBUG = true;
 
   function log() {
@@ -233,7 +233,7 @@
     return (label || "").replace(/\s+/g, " ").trim().slice(0, 100);
   }
 
-  function localContext(el) {
+  function localContext(el, tight) {
     if (!el || !el.closest) return "";
     const selectors = [
       "label", "fieldset", "[role='group']", "[role='radiogroup']",
@@ -256,10 +256,13 @@
         let prev = node.previousElementSibling;
         for (let n = 0; prev && n < 2; n++, prev = prev.previousElementSibling) {
           const text = (prev.innerText || prev.textContent || "").replace(/\s+/g, " ").trim();
+          // v25: a neighbouring error/hint line ("Enter your first name.") describes ANOTHER field
+          if (/^(enter|please|invalid|required|error|must|should|this field)\b|\b(is required|invalid)\b/i.test(text)) continue;
           if (text && text.length <= 120) return text;
         }
       }
     } catch (_) {}
+    if (tight) return "";
     try {
       const popup = el.closest("[role='dialog'],[role='listbox'],[role='menu'],[aria-modal='true'],[data-radix-popper-content-wrapper],.MuiPopover-root,.MuiMenu-paper,.ant-select-dropdown,.react-select__menu");
       if (popup) return (popup.innerText || popup.textContent || "").replace(/\s+/g, " ").trim().slice(0, 500);
@@ -324,21 +327,11 @@
     return false;
   }
 
-  function classify(el) {
+  function classifyCore(el, own, context, freshContext) {
     const tag = (el.tagName || "").toLowerCase();
     const type = (el.type || "").toLowerCase();
     const role = (el.getAttribute("role") || "").toLowerCase();
     const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
-    const own = [
-      getLabel(el), el.name, el.id, el.getAttribute("aria-label"),
-      el.getAttribute("placeholder"), el.getAttribute("data-testid"),
-      el.getAttribute("data-field"), el.getAttribute("data-value"),
-      el.getAttribute("data-type"), el.getAttribute("title"), el.getAttribute("class")
-    ].filter(Boolean).join(" ").toLowerCase();
-    const context = localContext(el).toLowerCase();
-    const popup = el.closest && el.closest("[role='listbox'],[role='menu'],[role='dialog'],[data-radix-popper-content-wrapper],.MuiPopover-root,.MuiMenu-paper,.ant-select-dropdown,.react-select__menu");
-    const optionLike = role === "option" || role === "menuitem" || tag === "li" || !!(popup && el !== popup);
-    const freshContext = optionLike && Date.now() - lastFieldContextAt < 15000 ? lastFieldContext : "";
     const c = (own + " " + context + " " + freshContext).replace(/\s+/g, " ").trim();
 
     const ownText = (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim();
@@ -357,6 +350,23 @@
     if (role === "combobox" && /^\+\d{1,4}$/.test(ownText) && (/\b(phone|mobile|tel)\b/.test(context + " " + own) || hasPhoneSibling)) return "countryCode";
     if (/^\+\d{1,4}$/.test(ownText) && nearPhoneInput(el)) return "countryCode";
 
+    if (ac) {
+      if (ac.includes("email")) return "email";
+      if (ac.includes("tel")) return "phone";
+      if (ac.includes("name")) {
+        if (ac.includes("given")) return "firstName";
+        if (ac.includes("family")) return "lastName";
+        return "fullName";
+      }
+      if (ac.includes("street")) return "address";
+      if (ac.includes("postal")) return "zip";
+      if (ac.includes("country")) return "country";
+      if (ac.includes("bday")) return "dob";
+    }
+    if (type === "email") return "email";
+    if (type === "tel") return "phone";
+    if (type === "password") return "password";
+    if (type === "date") return "dob";
     if (freshContext === "countryCode" ||
         /\b(country\s*(calling\s*)?code|calling\s*code|dial(?:ling)?\s*code|phone\s*code|international\s*prefix)\b/.test(c) ||
         /\b(iti__selected-flag|countrycode|country-code|dialcode|dial-code)\b/.test(own)) return "countryCode";
@@ -384,35 +394,61 @@
       if (/\b(gender|sex|male|female)\b/.test(c)) return "gender";
       return "termscheckbox";
     }
-    if (ac) {
-      if (ac.includes("email")) return "email";
-      if (ac.includes("tel")) return "phone";
-      if (ac.includes("name")) {
-        if (ac.includes("given")) return "firstName";
-        if (ac.includes("family")) return "lastName";
-        return "fullName";
-      }
-      if (ac.includes("street")) return "address";
-      if (ac.includes("postal")) return "zip";
-      if (ac.includes("country")) return "country";
-      if (ac.includes("bday")) return "dob";
-    }
-    if (type === "email") return "email";
-    if (type === "tel") return "phone";
-    if (type === "password") return "password";
-    if (type === "date") return "dob";
+    if (/\b(e-?mail)\b/.test(c)) return "email";
+    if (/\b(phone|mobile|tel|contact\s*number)\b/.test(c)) return "phone";
+    if (/\b(password|pass)\b/.test(c)) return "password";
     if (/\b(first|given)\s*name\b|\bfname\b/.test(c)) return "firstName";
     if (/\b(last|family|sur)\s*name\b|\blname\b/.test(c)) return "lastName";
     if (/\b(full\s*name|your\s*name|name)\b/.test(own)) return "fullName";
-    if (/\b(e-?mail)\b/.test(c)) return "email";
-    if (/\b(phone|mobile|tel)\b/.test(c)) return "phone";
-    if (/\b(password|pass)\b/.test(c)) return "password";
     if (/\b(city)\b/.test(c)) return "city";
     if (/\b(state|province|region)\b/.test(c)) return "state";
     if (/\b(zip|postal)\b/.test(c)) return "zip";
     if (/\b(country|nation)\b/.test(c)) return "country";
     if (tag === "textarea" || /\b(message|comment|description)\b/.test(own)) return "message";
     return "text";
+  }
+
+  function splitWords(v) {
+    return String(v || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_\-.:\/]+/g, " ");
+  }
+  function classify(el) {
+    const tag = (el.tagName || "").toLowerCase();
+    const type = (el.type || "").toLowerCase();
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    const strongParts = [
+      getLabel(el), el.name, el.id, el.getAttribute("aria-label"),
+      el.getAttribute("placeholder"), el.getAttribute("data-testid"),
+      el.getAttribute("data-field"), el.getAttribute("data-value"),
+      el.getAttribute("data-type"), el.getAttribute("title")
+    ].filter(Boolean).join(" ");
+    const classPart = el.getAttribute("class") || "";
+    // raw text plus a camelCase/snake_case split ("countrySelect" -> "country select") so \b rules can see the words
+    const strong = (strongParts + " " + splitWords(strongParts)).toLowerCase();
+    const ownAll = (strongParts + " " + classPart + " " + splitWords(strongParts + " " + classPart)).toLowerCase();
+    const buttonLike = tag === "button" || tag === "a" || role === "button" ||
+      (tag === "input" && CLICK_INPUT_TYPES.indexOf(type) !== -1);
+    const pickerish = role === "combobox" || role === "listbox" || el.hasAttribute("aria-haspopup") ||
+      el.hasAttribute("aria-expanded") && /\b(country|code|select|dial)\b/.test(ownAll);
+    // popups that really are option lists. A plain dialog/modal is NOT one: every control in a login modal used to
+    // inherit the last picker's type from it.
+    const listPopup = el.closest && el.closest("[role='listbox'],[role='menu'],[data-radix-popper-content-wrapper],.MuiPopover-root,.MuiMenu-paper,.ant-select-dropdown,.react-select__menu");
+    const optionLike = role === "option" || role === "menuitem" || tag === "li" || !!(listPopup && el !== listPopup);
+    const canInherit = optionLike && tag !== "input" && tag !== "textarea" && tag !== "select" && tag !== "button";
+    const fresh = canInherit && Date.now() - lastFieldContextAt < 15000 ? lastFieldContext : "";
+
+    // 1) the element's own label / name / placeholder, 2) plus its class names, 3) plus its tight surrounding label.
+    let r = classifyCore(el, strong + " " + fresh, "", fresh);
+    if (r !== "text" || buttonLike && !pickerish) {
+      // a plain button never becomes a data field because the form around it talks about dates or phones
+      if (buttonLike && !pickerish && ["countryCode", "country", "currency", "dob", "dobYear", "dobMonth", "dobDay", "state"].indexOf(r) !== -1 &&
+          !(r === "countryCode" && /^\+\d{1,4}$/.test((el.innerText || el.textContent || "").replace(/\s+/g, "")))) return "text";
+      return r;
+    }
+    r = classifyCore(el, ownAll + " " + fresh, "", fresh);
+    if (r !== "text") return r;
+    const tight = localContext(el, true).toLowerCase();
+    if (!tight) return "text";
+    return classifyCore(el, ownAll + " " + tight + " " + fresh, tight, fresh);
   }
 
   function isTextField(el) {
