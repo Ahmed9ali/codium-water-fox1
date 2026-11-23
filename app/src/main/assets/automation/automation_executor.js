@@ -32,7 +32,7 @@
   var IS_TOP = true;
   try { IS_TOP = window.top === window; } catch (_) { IS_TOP = false; }
 
-  var ELEMENT_WAIT_MS = 10000;
+  var ELEMENT_WAIT_MS = 15000;
   var FRAME_TIMEOUT_MS = 30000;
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
@@ -357,25 +357,31 @@
     return !!live && valueMatches(text(live) || live.value || "", p, true);
   }
 
-  async function chooseCustom(el, p) {
-    var wanted = String(p.wanted || "");
-    if (!wanted) return { ok: false, err: "no data value available for this field: " + p.fieldType };
-    var trigger = el;
-    if (el.id === "selectedCountry" || el.matches(".hwid-selectedCountryName,[id*=selectedCountry]")) {
-      trigger = el.closest("[role=button],button,[onclick],.hwid-countryWidthFix,.hwid-selectedCountryName") || el;
-    }
-    var before = text(trigger);
-    if (valueMatches(before, p, false)) return { ok: true, via: "already set" };
-    if (!synthClick(trigger)) return { ok: false, err: "custom select trigger could not be clicked" };
-    await sleep(450);
+  function nativeInfo(found, trigger, kind, label, p) {
+    try { found.scrollIntoView({ block: "center", inline: "nearest" }); } catch (_) {}
+    var rect = found.getBoundingClientRect();
+    var vv = window.visualViewport;
+    return {
+      x: rect.left + rect.width / 2, y: rect.top + rect.height / 2,
+      dpr: window.devicePixelRatio || 1,
+      vx: vv ? vv.offsetLeft : 0, vy: vv ? vv.offsetTop : 0, vs: vv ? vv.scale : 1
+    };
+  }
 
-    function notTrigger(o) { return o !== trigger && !trigger.contains(o); }
-    var found = null;
-    for (var i = 0; i < 15 && !found; i++) {
+  // Look for the wanted option in the list that is open NOW (trigger may be null: list rendered elsewhere).
+  async function findInOpenList(p, trigger) {
+    function notTrigger(o) { return !trigger || (o !== trigger && !trigger.contains(o)); }
+    var isYear = p.fieldType === "dobyear";
+    function scan() {
       var opts = findOptions().filter(notTrigger);
-      if (p.fieldType === "dobyear" || el.matches(".choose_value,[data-type=fydeos_select]")) {
+      if (isYear || (trigger && trigger.matches && trigger.matches(".choose_value,[data-type=fydeos_select]"))) {
         opts = opts.concat(deepAll("li,button,[role=option],div,span").filter(function (n) { return visible(n) && /^\d{4}$/.test(text(n)) && notTrigger(n); }));
       }
+      return opts;
+    }
+    var found = null, opts = [];
+    for (var i = 0; i < 15 && !found; i++) {
+      opts = scan();
       found = pickOption(opts, p);
       if (found) break;
       var sc = opts.length ? scrollParent(opts[opts.length - 1]) : null;
@@ -385,8 +391,26 @@
       await sleep(200);
       if (sc.scrollTop === prevTop) break;
     }
-    if (!found) return { ok: false, err: "opened custom selector but no matching option found: " + wanted };
+    if (found) return found;
+    // a search box inside the list: type the wanted value to filter it
+    var boxes = deepAll("input").filter(function (x) {
+      var t = lower(x.type || "text");
+      return visible(x) && (t === "search" || t === "text" || t === "") && notTrigger(x) && x !== trigger &&
+        /search|country|find|filter|code/.test(lower((x.placeholder || "") + " " + (x.getAttribute("aria-label") || "") + " " + (x.name || "")));
+    });
+    if (boxes.length) {
+      var box = boxes[0], q = p.fieldType === "countrycode" ? String(p.wanted).replace(/\D/g, "") : String(p.wanted);
+      try {
+        var w = box.ownerDocument.defaultView;
+        var d = Object.getOwnPropertyDescriptor(w.HTMLInputElement.prototype, "value");
+        d.set.call(box, q); dispatch(box, "input"); dispatch(box, "change");
+      } catch (_) {}
+      for (var k = 0; k < 6 && !found; k++) { await sleep(300); found = pickOption(scan(), p); }
+    }
+    return found;
+  }
 
+  async function clickOption(found, trigger, p) {
     var tries = [], cand = [rowOf(found), found];
     cand.forEach(function (x) { if (x && tries.indexOf(x) < 0) tries.push(x); });
     for (var t = 0; t < tries.length; t++) {
@@ -394,22 +418,48 @@
       await sleep(500);
       if (settled(p, found)) return { ok: true, via: "click" };
     }
-
     // The page ignored synthetic events. Hand the exact screen position to the engine so it can send a real touch.
-    var rect;
-    try { found.scrollIntoView({ block: "center", inline: "nearest" }); await sleep(200); } catch (_) {}
-    rect = found.getBoundingClientRect();
-    var vv = window.visualViewport;
+    var n = nativeInfo(found);
     g.__ddgPick = { p: p, found: found, label: text(found).slice(0, 40) };
     return {
       ok: false,
-      err: 'clicked option <' + lower(found.tagName) + '> "' + text(found).slice(0, 40) + '" but the page ignored it (trigger still "' + text(trigger).slice(0, 20) + '")',
-      native: {
-        x: rect.left + rect.width / 2, y: rect.top + rect.height / 2,
-        dpr: window.devicePixelRatio || 1,
-        vx: vv ? vv.offsetLeft : 0, vy: vv ? vv.offsetTop : 0, vs: vv ? vv.scale : 1
-      }
+      err: 'clicked option <' + lower(found.tagName) + '> "' + text(found).slice(0, 40) + '" but the page ignored it' + (trigger ? ' (trigger still "' + text(trigger).slice(0, 20) + '")' : ""),
+      native: n, stage: "option"
     };
+  }
+
+  // "pick": choose from a list that is already open in THIS document (the list can live outside the frame of its trigger)
+  async function pick(p) {
+    var wanted = String(p.wanted || "");
+    if (!wanted) return J({ ok: false, err: "no data value available for this field: " + p.fieldType });
+    var found = await findInOpenList(p, null);
+    if (!found) return J({ ok: false, err: "no matching option found: " + wanted });
+    return J(await clickOption(found, null, p));
+  }
+
+  async function chooseCustom(el, p) {
+    var wanted = String(p.wanted || "");
+    if (!wanted) return { ok: false, err: "no data value available for this field: " + p.fieldType };
+    var trigger = el;
+    if (el.id === "selectedCountry" || el.matches(".hwid-selectedCountryName,[id*=selectedCountry]")) {
+      trigger = el.closest("[role=button],button,[onclick],.hwid-countryWidthFix,.hwid-selectedCountryName") || el;
+    }
+    var before = text(trigger);
+    if (valueMatches(before, p, false)) return { ok: true, via: "already set" };
+    if (!p.skipOpen) {
+      if (!synthClick(trigger)) return { ok: false, err: "custom select trigger could not be clicked" };
+      await sleep(450);
+    }
+    var found = await findInOpenList(p, trigger);
+    if (!found) {
+      if (!p.skipOpen) {
+        // The page may ignore synthetic clicks on the trigger (list never opened): ask the engine for a real tap on it.
+        try { trigger.scrollIntoView({ block: "center", inline: "nearest" }); await sleep(150); } catch (_) {}
+        return { ok: false, stage: "open", native: nativeInfo(trigger), err: "opened custom selector but no matching option found: " + wanted };
+      }
+      return { ok: false, err: "opened custom selector but no matching option found: " + wanted };
+    }
+    return await clickOption(found, trigger, p);
   }
 
   async function verify() {
@@ -559,6 +609,7 @@
     if (kind === "fill") return await fill(params);
     if (kind === "click") return await click(params);
     if (kind === "verify") return await verify();
+    if (kind === "pick") return await pick(params);
     return J({ ok: false, err: "unknown executor call " + kind });
   }
 

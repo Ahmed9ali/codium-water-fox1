@@ -83,7 +83,7 @@ object AutomationEngine {
     private const val HUD_VIEW_TAG = "ddg_automation_hud_overlay"
     private const val ASYNC_BRIDGE_NAME = "AutomationAsync"
     private const val MAX_WAIT_MS = 300_000L
-    private const val PAGE_READY_TIMEOUT_MS = 10_000L
+    private const val PAGE_READY_TIMEOUT_MS = 25_000L
     private const val PAGE_READY_POST_MS = 1_000L
 
     private val DYNAMIC_FIELDS = setOf("email", "confirmemail", "phone", "confirmphone", "username", "otp", "country", "countrycode", "dob", "dobyear", "dobmonth", "dobday")
@@ -505,15 +505,15 @@ object AutomationEngine {
         }
     }
 
-    private fun resolveFieldValue(step: RecordedStep, recurringProfile: ActiveAutomationProfile, defaultProfile: ActiveAutomationProfile?): String {
+    private fun resolveFieldValue(step: RecordedStep, recurringProfile: ActiveAutomationProfile, defaultProfile: ActiveAutomationProfile?, occurrence: Int = 0): String {
         if (step.customValue.isNotBlank()) return step.customValue
         val looksLike = VaultRepository.normalizeFieldKey(step.fieldType)
         val isDynamic = DYNAMIC_FIELDS.contains(looksLike)
         val primary = if (isDynamic) recurringProfile else defaultProfile
         val fallback = if (isDynamic) defaultProfile else recurringProfile
-        val v1 = primary?.resolveForField(looksLike, step.name, step.tag)
+        val v1 = primary?.resolveForField(looksLike, step.name, step.tag, occurrence)
         if (!v1.isNullOrBlank()) return v1
-        return fallback?.resolveForField(looksLike, step.name, step.tag) ?: ""
+        return fallback?.resolveForField(looksLike, step.name, step.tag, occurrence) ?: ""
     }
 
     // ------------------------------------------------------------------------------------------------------------
@@ -540,7 +540,7 @@ object AutomationEngine {
         return if (end < 0) s else s.substring(end + FRAME_SUFFIX.length)
     }
 
-    private fun fillParams(step: RecordedStep, value: String, humanize: Boolean): JSONObject {
+    private fun fillParams(step: RecordedStep, value: String, humanize: Boolean, skipOpen: Boolean = false): JSONObject {
         val hints = listOf(step.placeholder, step.ariaLabel, step.displayLabel, step.fieldType)
             .map { it.trim() }.filter { it.isNotBlank() }.distinct()
         return JSONObject().apply {
@@ -552,6 +552,7 @@ object AutomationEngine {
             put("wanted", value)
             put("fieldType", step.fieldType.lowercase())
             put("humanize", humanize)
+            if (skipOpen) put("skipOpen", true)
         }
     }
 
@@ -648,13 +649,31 @@ object AutomationEngine {
 
     private suspend fun runFieldStep(webView: WebView, step: RecordedStep, value: String, humanize: Boolean): JSONObject {
         val host = frameHostOf(step)
+        var verifyHost = host
         var res = execStep(webView, "fill", fillParams(step, value, humanize), host)
+
+        // 1) The trigger of a custom list ignored dispatched clicks (the list never opened): tap it for real, then pick.
+        if (!res.optBoolean("ok", false) && res.optString("stage") == "open") {
+            val trigger = res.optJSONObject("native")
+            if (trigger != null && nativeTap(webView, trigger)) {
+                delay(700)
+                res = execStep(webView, "fill", fillParams(step, value, humanize, skipOpen = true), host)
+                if (!res.optBoolean("ok", false) && res.optJSONObject("native") == null && host != null) {
+                    // The list may be drawn outside the frame that holds its trigger: look for it in the top page.
+                    val top = execStep(webView, "pick", fillParams(step, value, humanize), "")
+                    if (top.optBoolean("ok", false) || top.optJSONObject("native") != null) { res = top; verifyHost = null }
+                }
+            } else {
+                res = JSONObject().put("ok", false).put("err", "could not tap the list opener on screen. " + res.optString("err"))
+            }
+        }
+
+        // 2) The page ignored dispatched clicks on the option: tap it for real, then check that the field changed.
         val nativeInfo = res.optJSONObject("native")
-        if (!res.optBoolean("ok", false) && nativeInfo != null) {
-            // The page ignored dispatched clicks: tap the option for real, then check that the field changed.
+        if (!res.optBoolean("ok", false) && nativeInfo != null && res.optString("stage") != "open") {
             if (nativeTap(webView, nativeInfo)) {
                 delay(500)
-                val verdict = execStep(webView, "verify", JSONObject(), host)
+                val verdict = execStep(webView, "verify", JSONObject(), verifyHost)
                 res = if (verdict.optBoolean("ok", false)) verdict
                 else JSONObject().put("ok", false).put("err", verdict.optString("err").ifBlank { res.optString("err") })
             } else {
@@ -681,7 +700,16 @@ object AutomationEngine {
         Log.d(TAG, "runScriptExecution: script=${script.name}, steps=${script.steps.size}, target=${config.targetRepeatCount}, navigateFirstCycle=$navigateFirstCycle")
 
         while (completed < config.targetRepeatCount && scope.isActive) {
-            val activeProfile = VaultRepository.acquireMergedProfile(config.groupNames, config.mode)
+            // fields of the same type on one page (two dates of birth...) each need their own value
+            val needs = mutableMapOf<String, Int>()
+            val occurrenceOf = IntArray(script.steps.size)
+            for ((i, st) in script.steps.withIndex()) {
+                if (st.kind != StepKind.Field || st.customValue.isNotBlank()) continue
+                val key = VaultRepository.normalizeFieldKey(st.fieldType)
+                occurrenceOf[i] = needs[key] ?: 0
+                needs[key] = occurrenceOf[i] + 1
+            }
+            val activeProfile = VaultRepository.acquireMergedProfile(config.groupNames, config.mode, needs)
             if (activeProfile == null) {
                 updateStatus("All selected recurring groups are empty or used.")
                 _dataExhaustedState.postValue(true)
@@ -690,22 +718,52 @@ object AutomationEngine {
             }
 
             val defaultProfile = if (!config.defaultGroupName.isNullOrBlank() && !config.groupNames.contains(config.defaultGroupName)) {
-                VaultRepository.acquireMergedProfile(listOf(config.defaultGroupName), "default")
+                VaultRepository.acquireMergedProfile(listOf(config.defaultGroupName), "default", needs)
             } else activeProfile
 
             updateState(AutomationState.NAVIGATING)
             updateStatus("Loading ${script.url}...")
-            ensureOnUrl(webView, script.url, forceReload = !isFirst || navigateFirstCycle || needsFrames)
+            markDoc(webView)
+            val loadedNew = ensureOnUrl(webView, script.url, forceReload = !isFirst || navigateFirstCycle || needsFrames)
             isFirst = false
+            if (loadedNew) {
+                // wait until the NEW document has replaced the old one before judging "ready"
+                var w = 0L
+                while (w < 6000L && docAlive(webView)) { delay(200); w += 200 }
+            }
+            updateStatus("Waiting for the page to finish loading...")
             waitForPageReady(webView)
             ensureExecutor(webView)
+            markDoc(webView)
 
             var lastError = ""
+            var stepIdx = 0
+            var segmentStart = 0       // first step since the last navigation: replayed if the page reloads under us
+            var reloadRecoveries = 0
 
-            for ((stepIdx, step) in script.steps.withIndex()) {
+            while (stepIdx < script.steps.size) {
+                val step = script.steps[stepIdx]
                 if (!scope.isActive) {
                     Log.d(TAG, "runScriptExecution: scope cancelled at step $stepIdx")
                     return
+                }
+                if (step.kind == StepKind.Field || step.kind == StepKind.ClickNext) {
+                    if (!docAlive(webView)) {
+                        // the page reloaded / navigated by itself: whatever was typed into the old page is gone
+                        updateStatus("Page reloaded, waiting for it...")
+                        waitForPageReady(webView)
+                        ensureExecutor(webView)
+                        markDoc(webView)
+                        if (stepIdx > segmentStart && reloadRecoveries < 3) {
+                            reloadRecoveries++
+                            Log.w(TAG, "Page reloaded mid-run: redoing steps ${segmentStart + 1}..$stepIdx (attempt $reloadRecoveries)")
+                            stepIdx = segmentStart
+                            continue
+                        }
+                    } else {
+                        // cheap guard: loaded and not changing right now
+                        waitForPageReady(webView, quietMs = 350L, maxMs = 8_000L, checkBusy = false)
+                    }
                 }
                 Log.d(TAG, "runScriptExecution: step ${stepIdx + 1}/${script.steps.size} kind=${step.kind} label=${step.displayLabel}")
                 lastError = ""
@@ -714,7 +772,7 @@ object AutomationEngine {
                     StepKind.Field -> {
                         updateState(AutomationState.FILLING)
                         updateStatus("Filling ${step.displayLabel}...")
-                        val valToFill = resolveFieldValue(step, activeProfile, defaultProfile)
+                        val valToFill = resolveFieldValue(step, activeProfile, defaultProfile, occurrenceOf[stepIdx])
                         if (config.humanize) delay(Random.nextLong(500, 3000))
 
                         val res = runFieldStep(webView, step, valToFill, config.humanize)
@@ -768,7 +826,11 @@ object AutomationEngine {
                         if (ok) {
                             Log.d(TAG, "ClickNext '${step.displayLabel}' succeeded via ${res.optString("via").ifBlank { "unknown" }}")
                             updateStatus("Waiting for page...")
-                            waitAfterClick(webView)
+                            if (waitAfterClick(webView)) {
+                                markDoc(webView)
+                                ensureExecutor(webView)
+                                segmentStart = stepIdx + 1
+                            }
                         } else {
                             lastError = res.optString("err").ifBlank { "no result from page (timeout)" }
                             Log.e(TAG, "ClickNext '${step.displayLabel}' failed: $lastError")
@@ -786,6 +848,7 @@ object AutomationEngine {
                     removeExecutorScript()
                     return
                 }
+                stepIdx++
             }
 
             VaultRepository.markProfileUsed(activeProfile)
@@ -1003,7 +1066,7 @@ object AutomationEngine {
     private fun normalizeUrl(u: String): String =
         u.trim().substringBefore('#').removePrefix("https://").removePrefix("http://").removePrefix("www.").trimEnd('/').lowercase()
 
-    private suspend fun ensureOnUrl(webView: WebView, targetUrl: String, forceReload: Boolean) {
+    private suspend fun ensureOnUrl(webView: WebView, targetUrl: String, forceReload: Boolean): Boolean {
         val target = normalizeUrl(targetUrl)
         if (!forceReload) {
             var waited = 0L
@@ -1011,7 +1074,7 @@ object AutomationEngine {
                 val cur = normalizeUrl(webView.url.orEmpty())
                 if (cur == target || cur.startsWith(target)) {
                     Log.d(TAG, "ensureOnUrl: already on target")
-                    return
+                    return false
                 }
                 delay(250)
                 waited += 250
@@ -1020,45 +1083,68 @@ object AutomationEngine {
         Log.d(TAG, "ensureOnUrl: loading $targetUrl")
         webView.loadUrl(if (targetUrl.startsWith("http")) targetUrl else "https://$targetUrl")
         delay(500)
+        return true
     }
 
-    private suspend fun waitAfterClick(webView: WebView) {
+    /** Returns true when the click navigated / reloaded the page. */
+    private suspend fun waitAfterClick(webView: WebView): Boolean {
         var waited = 0L
         while (waited < 2500L) {
             delay(250)
             waited += 250
-            val s = evaluateJsSuspend(webView, "return window.__ddgNavMark ? 'same' : 'new';", 3000L)
-            if (s == "new") {
+            if (!docAlive(webView)) {
                 waitForPageReady(webView)
-                return
+                return true
             }
         }
         delay(300)
+        return false
     }
 
-    private suspend fun waitForPageReady(webView: WebView) {
-        var waited = 0L
-        var lastLog = -1L
-        while (waited < PAGE_READY_TIMEOUT_MS) {
-            val progress = withContext(Dispatchers.Main) { webView.progress }
-            val readyState = try {
-                evaluateJsSuspend(webView, "return document.readyState;", 2000L).trim('"')
-            } catch (_: Exception) { "" }
+    /** Marks the current document; the mark is gone after any navigation / reload. */
+    private suspend fun markDoc(webView: WebView) {
+        try { evaluateJsSuspend(webView, "window.__ddgNavMark = 1; return 'ok';", 3000L) } catch (_: Exception) {}
+    }
 
-            if (progress >= 100 || readyState == "complete" || readyState == "interactive") {
-                Log.d(TAG, "Page ready: progress=$progress readyState=$readyState waited=${waited}ms")
-                delay(PAGE_READY_POST_MS)
+    private suspend fun docAlive(webView: WebView): Boolean = try {
+        evaluateJsSuspend(webView, "return window.__ddgNavMark ? 'y' : 'n';", 3000L).trim('"') == "y"
+    } catch (_: Exception) { false }
+
+    private fun readyProbeJs(quietMs: Long, checkBusy: Boolean): String =
+        "var w=window,now=Date.now();" +
+        "if(!w.__ddgMo){w.__ddgLast=now;try{new MutationObserver(function(){w.__ddgLast=Date.now();}).observe(document.documentElement,{subtree:true,childList:true,attributes:true});}catch(e){}w.__ddgMo=1;}" +
+        "var busy=false;" +
+        (if (checkBusy) "try{var q=document.querySelectorAll('[aria-busy=\"true\"],[role=progressbar],[class*=spinner i],[class*=loader i],[class*=loading i],[class*=skeleton i]');" +
+            "for(var i=0;i<30&&i<q.length;i++){var r=q[i].getBoundingClientRect(),cs=getComputedStyle(q[i]);" +
+            "if(r.width>24&&r.height>24&&cs.visibility!=='hidden'&&cs.display!=='none'&&cs.opacity!=='0'&&q[i].offsetParent!==null){busy=true;break;}}}catch(e){}" else "") +
+        "return (document.readyState==='complete'&&(now-w.__ddgLast)>=" + quietMs + "&&!busy)?'ok':'wait';"
+
+    /**
+     * Waits until the page has really finished: loaded, the DOM has been quiet for [quietMs] and (optionally) no big
+     * spinner / skeleton is showing. The old check accepted "interactive" and the previous page's "complete", so
+     * fields were filled into a page that was about to be replaced.
+     */
+    private suspend fun waitForPageReady(
+        webView: WebView,
+        quietMs: Long = 800L,
+        maxMs: Long = PAGE_READY_TIMEOUT_MS,
+        checkBusy: Boolean = true,
+    ) {
+        var waited = 0L
+        while (waited < maxMs && scope.isActive) {
+            val progress = withContext(Dispatchers.Main) { webView.progress }
+            val state = try {
+                evaluateJsSuspend(webView, "return (function(){" + readyProbeJs(quietMs, checkBusy && waited < 12_000L) + "})();", 2500L).trim('"')
+            } catch (_: Exception) { "wait" }
+            if (progress >= 100 && state == "ok") {
+                Log.d(TAG, "Page ready: progress=$progress waited=${waited}ms")
                 return
             }
-            if (waited - lastLog >= 2000L) {
-                Log.d(TAG, "Page loading: progress=$progress readyState=$readyState waited=${waited}ms")
-                lastLog = waited
-            }
+            if (waited % 2000L == 0L) Log.d(TAG, "Page loading: progress=$progress state=$state waited=${waited}ms")
             delay(200)
             waited += 200
         }
-        Log.w(TAG, "Page ready timeout after ${PAGE_READY_TIMEOUT_MS}ms; proceeding anyway")
-        delay(PAGE_READY_POST_MS)
+        Log.w(TAG, "Page ready timeout after ${maxMs}ms; proceeding anyway")
     }
 
     private suspend fun evaluateJsSuspend(webView: WebView, body: String, timeoutMs: Long = 15_000L): String {

@@ -31,10 +31,17 @@ data class VaultGroup(
 data class ActiveAutomationProfile(
     val consumed: Map<String, List<Int>>,
     val fields: Map<String, String>,
+    /** Every value taken for a type, in order: the 2nd field of the same type on a page uses the 2nd value. */
+    val lists: Map<String, List<String>> = emptyMap(),
 ) {
-    fun resolveForField(looksLike: String, fieldName: String = "", tag: String = ""): String? {
+    fun resolveForField(looksLike: String, fieldName: String = "", tag: String = "", occurrence: Int = 0): String? {
         val normalizedType = VaultRepository.normalizeFieldKey(looksLike)
-        
+
+        // 0. Same field type twice on one page (two dates of birth, two e-mails...): use the matching entry
+        if (occurrence > 0) {
+            lists[normalizedType]?.getOrNull(occurrence)?.let { if (it.isNotBlank()) return it }
+        }
+
         // 1. Direct match
         fields[normalizedType]?.let { if (it.isNotBlank()) return it }
 
@@ -284,8 +291,13 @@ object VaultRepository {
 
     fun hasUnusedData(groupName: String): Boolean = unusedProfileCount(groupName) > 0
 
-    fun acquireMergedProfile(groupNames: List<String>, mode: String): ActiveAutomationProfile? {
+    /**
+     * [needs] says how many fields of each type the script has (e.g. dob -> 2). That many unused entries are taken
+     * for the type, so two date-of-birth boxes get two different values.
+     */
+    fun acquireMergedProfile(groupNames: List<String>, mode: String, needs: Map<String, Int> = emptyMap()): ActiveAutomationProfile? {
         val chosenFields = mutableMapOf<String, String>()
+        val chosenLists = mutableMapOf<String, MutableList<String>>()
         val consumed = mutableMapOf<String, List<Int>>()
         var anyFound = false
 
@@ -309,15 +321,24 @@ object VaultRepository {
 
             for ((typeKey, candidates) in byType) {
                 if (candidates.isEmpty()) continue
-                val picked = when (mode.lowercase()) {
-                    "bottom_up", "bottom" -> candidates.last()
-                    "random" -> candidates[randomSlot.coerceAtMost(candidates.lastIndex)]
-                    else -> candidates.first()
+                val want = ((needs[typeKey] ?: 1) - (chosenLists[typeKey]?.size ?: 0)).coerceAtLeast(1).coerceAtMost(candidates.size)
+                val ordered = when (mode.lowercase()) {
+                    "bottom_up", "bottom" -> candidates.asReversed()
+                    "random" -> {
+                        val first = candidates[randomSlot.coerceAtMost(candidates.lastIndex)]
+                        listOf(first) + candidates.filter { it !== first }.shuffled()
+                    }
+                    else -> candidates
+                }
+                val picks = ordered.take(want)
+                val bucket = chosenLists.getOrPut(typeKey) { mutableListOf() }
+                for (picked in picks) {
+                    bucket.add(picked.second.value)
+                    groupConsumed.add(picked.first)
                 }
                 if (!chosenFields.containsKey(typeKey)) {
-                    chosenFields[typeKey] = picked.second.value
+                    chosenFields[typeKey] = picks.first().second.value
                 }
-                groupConsumed.add(picked.first)
             }
             consumed[name] = groupConsumed
         }
@@ -336,7 +357,7 @@ object VaultRepository {
             if (!chosenFields.containsKey("surname") && parts.size > 1) chosenFields["surname"] = parts.last()
         }
 
-        return ActiveAutomationProfile(consumed, chosenFields)
+        return ActiveAutomationProfile(consumed, chosenFields, chosenLists)
     }
 
     // "+216", "+91", "+ 60": a bare dial code. It was sometimes stored as EMAIL/TEXT/OTP by the single-token guesser.
