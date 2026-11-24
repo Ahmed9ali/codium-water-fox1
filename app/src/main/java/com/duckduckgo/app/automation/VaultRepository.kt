@@ -35,7 +35,14 @@ data class ActiveAutomationProfile(
     val lists: Map<String, List<String>> = emptyMap(),
 ) {
     fun resolveForField(looksLike: String, fieldName: String = "", tag: String = "", occurrence: Int = 0): String? {
-        val normalizedType = VaultRepository.normalizeFieldKey(looksLike)
+        // "dob2" = the second date-of-birth field of a page. It has its own pool ("dob2" entries); when there is none,
+        // it takes the second value of the plain pool, never the same value as the first field.
+        val (baseKey, ordinal) = VaultRepository.splitOrdinal(looksLike)
+        if (ordinal > 1) {
+            fields[baseKey + ordinal]?.let { if (it.isNotBlank()) return it }
+            lists[baseKey]?.getOrNull(ordinal - 1)?.let { if (it.isNotBlank()) return it }
+        }
+        val normalizedType = baseKey
 
         // 0. Same field type twice on one page (two dates of birth, two e-mails...): use the matching entry
         if (occurrence > 0) {
@@ -46,7 +53,7 @@ data class ActiveAutomationProfile(
         fields[normalizedType]?.let { if (it.isNotBlank()) return it }
 
         // 2. Match by raw field name
-        if (fieldName.isNotBlank()) {
+        if (fieldName.isNotBlank() && ordinal <= 1) {
             val normalizedName = VaultRepository.normalizeFieldKey(fieldName)
             fields[normalizedName]?.let { if (it.isNotBlank()) return it }
         }
@@ -54,7 +61,7 @@ data class ActiveAutomationProfile(
         // 3. Fuzzy matching is unsafe for semantically distinct selectors such as
         // country vs country-code and DOB vs birth-year. Keep those exact-only.
         val exactOnlyTypes = setOf("country", "countrycode", "dob", "dobyear", "dobmonth", "dobday")
-        if (normalizedType !in exactOnlyTypes) {
+        if (normalizedType !in exactOnlyTypes && ordinal <= 1) {
             val fuzzyMatch = fields.entries.firstOrNull {
                 it.value.isNotBlank() && it.key.isNotBlank() &&
                     (it.key.contains(normalizedType) || normalizedType.contains(it.key))
@@ -153,7 +160,7 @@ object VaultRepository {
     }
 
     fun addSpecificEntries(groupName: String, fieldType: String, rawValues: String) {
-        val normalizedType = normalizeFieldKey(fieldType)
+        val normalizedType = slotKey(fieldType)
         val newEntries = rawValues
             .lines()
             .map { it.trim() }
@@ -161,7 +168,7 @@ object VaultRepository {
             .map { line ->
                 val parts = line.split(":", limit = 2)
                 if (parts.size == 2 && parts[0].trim().length in 2..20 && !parts[0].contains("@") && !parts[0].contains(" ")) {
-                    VaultEntry(fieldType = normalizeFieldKey(parts[0]), value = parts[1].trim(), used = false)
+                    VaultEntry(fieldType = slotKey(parts[0]), value = parts[1].trim(), used = false)
                 } else {
                     VaultEntry(fieldType = normalizedType, value = line, used = false)
                 }
@@ -176,7 +183,7 @@ object VaultRepository {
     }
 
     fun updateEntry(groupName: String, index: Int, newFieldType: String, newValue: String) {
-        val normalizedType = normalizeFieldKey(newFieldType)
+        val normalizedType = slotKey(newFieldType)
         groups.value = groups.value.map { g ->
             if (g.name != groupName) return@map g
             val updated = g.entries.toMutableList()
@@ -315,13 +322,19 @@ object VaultRepository {
                 byType.getOrPut(key) { mutableListOf() }.add(pair)
             }
 
+            // a "dob2" field with no "dob2" pool in this group borrows the next entry of the plain "dob" pool
+            val extra = mutableMapOf<String, Int>()
+            for (nk in needs.keys) {
+                val (b, o) = splitOrdinal(nk)
+                if (o > 1 && byType[nk].isNullOrEmpty()) extra[b] = (extra[b] ?: 0) + 1
+            }
             val groupConsumed = mutableListOf<Int>()
             val maxBucketSize = byType.values.maxOfOrNull { it.size } ?: 1
             val randomSlot = if (maxBucketSize > 1) Random.nextInt(maxBucketSize) else 0
 
             for ((typeKey, candidates) in byType) {
                 if (candidates.isEmpty()) continue
-                val want = ((needs[typeKey] ?: 1) - (chosenLists[typeKey]?.size ?: 0)).coerceAtLeast(1).coerceAtMost(candidates.size)
+                val want = ((needs[typeKey] ?: 1) + (extra[typeKey] ?: 0) - (chosenLists[typeKey]?.size ?: 0)).coerceAtLeast(1).coerceAtMost(candidates.size)
                 val ordered = when (mode.lowercase()) {
                     "bottom_up", "bottom" -> candidates.asReversed()
                     "random" -> {
@@ -372,9 +385,10 @@ object VaultRepository {
      * year (judged by its size and by the group name); anything typed EMAIL without an "@" takes the group's type.
      */
     fun effectiveType(entry: VaultEntry, groupName: String = ""): String {
-        val key = normalizeFieldKey(entry.fieldType)
+        val (key, ord) = splitOrdinal(entry.fieldType)
         val v = entry.value.trim()
         if (DIAL_CODE.matches(v) && key != "countrycode") return "countrycode"
+        if (ord > 1) return key + ord          // "dob2" etc.: the person chose this pool on purpose
         val gname = groupName.lowercase()
         val ghint = if (groupName.isBlank()) "" else normalizeFieldKey(groupName)
         val misTyped = (key == "email" && !v.contains("@")) || key == "text"
@@ -400,7 +414,23 @@ object VaultRepository {
 
     private fun repairEntry(e: VaultEntry, groupName: String = ""): VaultEntry {
         val t = effectiveType(e, groupName)
-        return if (t != normalizeFieldKey(e.fieldType)) e.copy(fieldType = t) else e
+        return if (t != slotKey(e.fieldType)) e.copy(fieldType = t) else e
+    }
+
+    /** "dob2" -> ("dob", 2); a plain type is ordinal 1. ("password2" has always meant confirm-password.) */
+    fun splitOrdinal(raw: String): Pair<String, Int> {
+        val t = raw.trim().lowercase()
+        val m = Regex("^(.*[a-z_\\-\\s])([2-9])$").matchEntire(t) ?: return normalizeFieldKey(t) to 1
+        val base = normalizeFieldKey(m.groupValues[1])
+        val ord = m.groupValues[2].toInt()
+        if (base == "password" && ord == 2) return "confirmpassword" to 1
+        return base to ord
+    }
+
+    /** Key of a data pool: the base type, plus the ordinal from the 2nd field of that type on ("dob", "dob2", "dob3"). */
+    fun slotKey(raw: String): String {
+        val (b, o) = splitOrdinal(raw)
+        return if (o > 1) b + o else b
     }
 
     fun normalizeFieldKey(raw: String): String {
@@ -450,7 +480,7 @@ object VaultRepository {
         rawText.lines().map { it.trim() }.filter { it.isNotEmpty() }.forEach { line ->
             val colonParts = line.split(":", limit = 2)
             if (colonParts.size == 2 && colonParts[0].trim().length in 2..25 && !colonParts[0].contains("@")) {
-                val key = normalizeFieldKey(colonParts[0])
+                val key = slotKey(colonParts[0])
                 val value = colonParts[1].trim()
                 if (value.isNotEmpty()) {
                     result.add(VaultEntry(fieldType = key, value = value, used = false))

@@ -505,10 +505,12 @@ object AutomationEngine {
         }
     }
 
-    private fun resolveFieldValue(step: RecordedStep, recurringProfile: ActiveAutomationProfile, defaultProfile: ActiveAutomationProfile?, occurrence: Int = 0): String {
+    /** [slot] is the data pool of this field: "dob" for the first date of birth on a page, "dob2" for the second... */
+    private fun resolveFieldValue(step: RecordedStep, recurringProfile: ActiveAutomationProfile, defaultProfile: ActiveAutomationProfile?, slot: String = ""): String {
         if (step.customValue.isNotBlank()) return step.customValue
-        val looksLike = VaultRepository.normalizeFieldKey(step.fieldType)
-        val isDynamic = DYNAMIC_FIELDS.contains(looksLike)
+        val looksLike = slot.ifBlank { VaultRepository.slotKey(step.fieldType) }
+        val occurrence = 0
+        val isDynamic = DYNAMIC_FIELDS.contains(VaultRepository.splitOrdinal(looksLike).first)
         val primary = if (isDynamic) recurringProfile else defaultProfile
         val fallback = if (isDynamic) defaultProfile else recurringProfile
         val v1 = primary?.resolveForField(looksLike, step.name, step.tag, occurrence)
@@ -550,7 +552,7 @@ object AutomationEngine {
             put("xpath", step.xpath)
             put("hints", JSONArray(hints))
             put("wanted", value)
-            put("fieldType", step.fieldType.lowercase())
+            put("fieldType", step.fieldType.lowercase().replace(Regex("(?<=[a-z])[2-9]$"), ""))   // "dob2" -> "dob"
             put("humanize", humanize)
             if (skipOpen) put("skipOpen", true)
         }
@@ -701,13 +703,18 @@ object AutomationEngine {
 
         while (completed < config.targetRepeatCount && scope.isActive) {
             // fields of the same type on one page (two dates of birth...) each need their own value
+            // The 2nd one gets its own data pool: "dob", "dob2", "dob3"...
             val needs = mutableMapOf<String, Int>()
-            val occurrenceOf = IntArray(script.steps.size)
+            val slotOf = Array(script.steps.size) { "" }
+            val seenOfType = mutableMapOf<String, Int>()
             for ((i, st) in script.steps.withIndex()) {
                 if (st.kind != StepKind.Field || st.customValue.isNotBlank()) continue
-                val key = VaultRepository.normalizeFieldKey(st.fieldType)
-                occurrenceOf[i] = needs[key] ?: 0
-                needs[key] = occurrenceOf[i] + 1
+                val (base, explicit) = VaultRepository.splitOrdinal(st.fieldType)
+                val ord = if (explicit > 1) explicit else (seenOfType[base] ?: 0) + 1
+                if (explicit <= 1) seenOfType[base] = ord
+                val slot = if (ord > 1) base + ord else base
+                slotOf[i] = slot
+                needs[slot] = (needs[slot] ?: 0) + 1
             }
             val activeProfile = VaultRepository.acquireMergedProfile(config.groupNames, config.mode, needs)
             if (activeProfile == null) {
@@ -772,7 +779,7 @@ object AutomationEngine {
                     StepKind.Field -> {
                         updateState(AutomationState.FILLING)
                         updateStatus("Filling ${step.displayLabel}...")
-                        val valToFill = resolveFieldValue(step, activeProfile, defaultProfile, occurrenceOf[stepIdx])
+                        val valToFill = resolveFieldValue(step, activeProfile, defaultProfile, slotOf[stepIdx])
                         if (config.humanize) delay(Random.nextLong(500, 3000))
 
                         val res = runFieldStep(webView, step, valToFill, config.humanize)
@@ -1454,9 +1461,18 @@ object AutomationEngine {
             }
             lastRecordedAt = now
 
-            val canonicalType = if (stepKind == StepKind.Field) FieldTypeMapper.normalizeLooksLike(looksLike) else ""
-            val rawLabel = if (stepKind == StepKind.ClickNext) obj.optString("buttonLabel", "Next button")
-                           else FieldTypeMapper.fieldRowLabel(canonicalType, obj.optString("displayLabel", ""))
+            val plainType = if (stepKind == StepKind.Field) FieldTypeMapper.normalizeLooksLike(looksLike) else ""
+            // A second field of the same type on this page becomes "dob2", "email2"...: it has its own data pool.
+            val sameBefore = if (plainType.isBlank()) 0 else hudRecordedSteps.count {
+                it.kind == StepKind.Field && VaultRepository.splitOrdinal(it.fieldType).first == VaultRepository.splitOrdinal(plainType).first
+            }
+            val ordinal = sameBefore + 1
+            val canonicalType = if (ordinal in 2..9) plainType + ordinal else plainType
+            var rawLabel = if (stepKind == StepKind.ClickNext) obj.optString("buttonLabel", "Next button")
+                           else FieldTypeMapper.fieldRowLabel(plainType, obj.optString("displayLabel", ""))
+            if (ordinal in 2..9 && stepKind == StepKind.Field) {
+                rawLabel = if (rawLabel.endsWith(" Input")) rawLabel.removeSuffix(" Input") + " $ordinal Input" else "$rawLabel $ordinal"
+            }
             val displayLabel = sanitizeString(rawLabel, 100)
             val step = RecordedStep(
                 sequenceIndex = hudRecordedSteps.size + 1,

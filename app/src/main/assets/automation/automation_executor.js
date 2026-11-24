@@ -100,6 +100,30 @@
   var FIELD_SEL = "input:not([type=hidden]),textarea,select,button,[role=combobox],[aria-haspopup],.choose_value,#selectedCountry,.hwid-selectedCountryName,[id*=selectedCountry]";
   var CUSTOM_SEL = "button,[role=combobox],[aria-haspopup],.choose_value,[data-type=fydeos_select],#selectedCountry,.hwid-selectedCountryName,[id*=selectedCountry]";
 
+  // The "+91 v" opener of a phone field: a small element whose whole text is a dial code, next to a phone input.
+  function findDialTrigger() {
+    var cands = deepAll("button,[role=button],[role=combobox],[aria-haspopup],div,span,a,p,label").filter(function (e) {
+      if (!visible(e)) return false;
+      var t = text(e).replace(/\s+/g, "");
+      if (!/^\+\d{1,4}$/.test(t)) return false;
+      var r = e.getBoundingClientRect();
+      return r.width < 260 && r.height < 120;
+    });
+    if (!cands.length) return null;
+    function nearPhone(e) {
+      var n = e.parentElement;
+      for (var d = 0; n && d < 5; d++, n = n.parentElement) {
+        if (n.querySelector("input[type=tel],input[autocomplete^=tel],input[name*=phone i],input[name*=mobile i],input[placeholder*=phone i],input[placeholder*=mobile i]")) return true;
+      }
+      return false;
+    }
+    var near = cands.filter(nearPhone);
+    var pool = near.length ? near : cands;
+    // innermost element holding the dial code, then climb to something clickable
+    var best = pool[pool.length - 1];
+    for (var i = 0; i < pool.length; i++) { if (!pool.some(function (o) { return o !== pool[i] && pool[i].contains(o); })) { best = pool[i]; break; } }
+    return best.closest("button,[role=button],[role=combobox],[aria-haspopup]") || best;
+  }
   function findElement(p) {
     var tries = [
       function () { return p.id ? document.getElementById(p.id) : null; },
@@ -111,6 +135,10 @@
       try { var el = tries[i](); if (visible(el)) return el; } catch (_) {}
     }
     var all = deepAll(FIELD_SEL).filter(visible);
+    if (p.fieldType === "countrycode") {
+      var cc = findDialTrigger();
+      if (cc) return cc;
+    }
     var hints = (p.hints || []).map(lower);
     for (var h = 0; h < hints.length; h++) {
       if (!hints[h]) continue;
@@ -134,6 +162,8 @@
     return { y: y, m: m, d: d };
   }
   // returns {y,m,d} or null. A bare year becomes 1 January of that year.
+  // two-digit year: 09 -> 2009, 99 -> 1999 (anything not in the future is taken as 20xx)
+  function fullYear(yy) { return yy <= (new Date().getFullYear() % 100) ? 2000 + yy : 1900 + yy; }
   function parseDate(s) {
     s = String(s || "").trim();
     var m;
@@ -145,6 +175,21 @@
       return ymd(m[3], b, a);                   // ambiguous: day first (same assumption the scanner made)
     }
     if ((m = s.match(/^(\d{4})(\d{2})(\d{2})$/))) return ymd(m[1], m[2], m[3]);
+    // 12/07/09 (two-digit year) and 12/may/2001, 12-May-01, 12 May 01 (month as a word, any separator)
+    if ((m = s.match(/^(\d{1,2})\s*[-\/. ]\s*(\d{1,2}|[A-Za-z]{3,9})\.?\s*[-\/. ,]\s*(\d{2}|\d{4})$/))) {
+      var yy = m[3].length === 2 ? fullYear(+m[3]) : +m[3];
+      if (/^[A-Za-z]/.test(m[2])) {
+        var im = MONTHS.indexOf(lower(m[2]).slice(0, 3));
+        return im >= 0 ? ymd(yy, im + 1, m[1]) : null;
+      }
+      var da = +m[1], mb = +m[2];
+      if (da > 12) return ymd(yy, mb, da);
+      if (mb > 12) return ymd(yy, da, mb);
+      return ymd(yy, mb, da);                   // day first
+    }
+    if ((m = s.match(/^(\d{4})\s*[-\/. ]\s*([A-Za-z]{3,9})\.?\s*[-\/. ]\s*(\d{1,2})$/))) {
+      var iy = MONTHS.indexOf(lower(m[2]).slice(0, 3)); return iy >= 0 ? ymd(m[1], iy + 1, m[3]) : null;
+    }
     if ((m = s.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})$/))) {
       var i1 = MONTHS.indexOf(lower(m[2]).slice(0, 3)); return i1 >= 0 ? ymd(m[3], i1 + 1, m[1]) : null;
     }

@@ -1,5 +1,5 @@
 /*
- * Automation Recorder v25
+ * Automation Recorder v26
  *
  * v23: records inside iframes. The recorder now runs in every frame (document-start script), a child frame posts each
  *      captured tap to the top page with postMessage, the top page queues it for Kotlin and sends the result back so the
@@ -23,7 +23,7 @@
 (function () {
   "use strict";
   const g = globalThis;
-  const VERSION = "v25";
+  const VERSION = "v26";
   const DEBUG = true;
 
   function log() {
@@ -250,11 +250,25 @@
         }
       } catch (_) {}
     }
+    // v26: the label that sits NEXT TO this input inside its own wrapper (floating labels, <div>/<span> captions).
+    // Climb only while the wrapper still holds exactly this one field; the text of another field never counts.
+    try {
+      let wrap = el.parentElement;
+      for (let depth = 0; wrap && depth < 3; depth++, wrap = wrap.parentElement) {
+        if (wrap.querySelectorAll("input:not([type=hidden]),select,textarea,[role=combobox]").length > 1) break;
+        const lines = (wrap.innerText || wrap.textContent || "").split(/\n+/).map(function (x) { return x.replace(/\s+/g, " ").trim(); })
+          .filter(function (x) { return x && !/^(enter|please|invalid|required|error|must|should|this field)\b|\b(is required|invalid)\b/i.test(x); });
+        const joined = lines.join(" ");
+        if (joined && joined.length <= 80) return joined;
+      }
+    } catch (_) {}
     try {
       let node = el;
       for (let depth = 0; node && depth < 3; depth++, node = node.parentElement) {
         let prev = node.previousElementSibling;
         for (let n = 0; prev && n < 2; n++, prev = prev.previousElementSibling) {
+          // v26: a previous sibling that contains a field is ANOTHER field's block: stop looking
+          if (prev.querySelector && prev.querySelector("input:not([type=hidden]),select,textarea,[role=combobox]")) break;
           const text = (prev.innerText || prev.textContent || "").replace(/\s+/g, " ").trim();
           // v25: a neighbouring error/hint line ("Enter your first name.") describes ANOTHER field
           if (/^(enter|please|invalid|required|error|must|should|this field)\b|\b(is required|invalid)\b/i.test(text)) continue;
