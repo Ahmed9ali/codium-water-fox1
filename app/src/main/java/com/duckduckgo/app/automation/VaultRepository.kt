@@ -88,6 +88,8 @@ data class ActiveAutomationProfile(
                 "$first $last".trim().ifBlank { fields["username"] ?: fields["email"]?.substringBefore("@") }
             }
             "username" -> fields["email"]?.substringBefore("@") ?: fields["fullname"]?.replace(" ", "_")
+            "website" -> fields["url"] ?: fields["text"]
+            "company" -> fields["text"]
             "message" -> fields["message"] ?: fields["subject"] ?: fields["text"]
             "subject" -> fields["subject"] ?: fields["message"] ?: fields["text"]
             // Never substitute generic text for structured selectors. A country
@@ -389,6 +391,11 @@ object VaultRepository {
         val v = entry.value.trim()
         if (DIAL_CODE.matches(v) && key != "countrycode") return "countrycode"
         if (ord > 1) return key + ord          // "dob2" etc.: the person chose this pool on purpose
+        // A group named "Dob2" holds the SECOND date of birth: its DOB entries belong to the dob2 pool
+        if (groupName.isNotBlank()) {
+            val (gBase, gOrd) = splitOrdinal(groupName)
+            if (gOrd > 1 && gBase == key) return key + gOrd
+        }
         val gname = groupName.lowercase()
         val ghint = if (groupName.isBlank()) "" else normalizeFieldKey(groupName)
         val misTyped = (key == "email" && !v.contains("@")) || key == "text"
@@ -465,7 +472,8 @@ object VaultRepository {
             clean in listOf("zip", "zipcode", "postal", "postalcode", "pincode", "pin") -> "zip"
             clean in listOf("country", "nation") -> "country"
             clean in listOf("countrycode", "countrycallingcode", "callingcode", "dialcode", "diallingcode", "isdcode", "phonecode") -> "countrycode"
-            clean in listOf("company", "organization", "organisation", "business") -> "company"
+            clean in listOf("company", "companyname", "organization", "organisation", "organizationname", "organisationname", "business", "businessname", "employer", "firm") -> "company"
+            clean in listOf("website", "web", "site", "url", "homepage", "weburl", "websiteurl", "companywebsite", "link") -> "website"
             clean in listOf("jobtitle", "designation", "position", "role") -> "jobtitle"
             clean in listOf("otp", "code", "verificationcode") -> "otp"
             else -> clean.ifBlank { "text" }

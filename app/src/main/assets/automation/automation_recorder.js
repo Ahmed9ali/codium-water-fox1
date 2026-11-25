@@ -1,5 +1,5 @@
 /*
- * Automation Recorder v26
+ * Automation Recorder v27
  *
  * v23: records inside iframes. The recorder now runs in every frame (document-start script), a child frame posts each
  *      captured tap to the top page with postMessage, the top page queues it for Kotlin and sends the result back so the
@@ -23,7 +23,7 @@
 (function () {
   "use strict";
   const g = globalThis;
-  const VERSION = "v26";
+  const VERSION = "v27";
   const DEBUG = true;
 
   function log() {
@@ -51,6 +51,23 @@
     } catch (_) {}
   }
 
+  // v27: remember which elements the PAGE gave a click handler (addEventListener). Icons wrapped in a plain div with a
+  // JS handler have no tag, role or cursor that says "button"; this is the only reliable sign.
+  try {
+    if (!g.__ddgClicky) g.__ddgClicky = new WeakSet();
+    const origAdd = EventTarget.prototype.addEventListener;
+    if (!origAdd.__ddgPatched) {
+      const patched = function (type, fn, opts) {
+        try {
+          if (this && this.nodeType === 1 && /^(click|pointerdown|pointerup|mousedown|mouseup|touchstart|touchend)$/.test(type)) g.__ddgClicky.add(this);
+        } catch (_) {}
+        return origAdd.call(this, type, fn, opts);
+      };
+      patched.__ddgPatched = true;
+      EventTarget.prototype.addEventListener = patched;
+    }
+  } catch (_) {}
+
   const CFG = { TOASTS: true, OUTBOX_MAX: 200, PUMP_MS: 300, TAP_MAX_MS: 800, MOVE_PX: 30, POINTER_SCAN_DEPTH: 6 };
 
   // ---- re-injection: only skip when we are really bound to THIS document ----
@@ -69,6 +86,7 @@
   };
 
   let lastTarget = null;
+  let lastPickerEl = null, lastPickerAt = 0;
   let lastTime = 0;
   let lastFieldContext = "";
   let lastFieldContextAt = 0;
@@ -411,6 +429,8 @@
     if (/\b(e-?mail)\b/.test(c)) return "email";
     if (/\b(phone|mobile|tel|contact\s*number)\b/.test(c)) return "phone";
     if (/\b(password|pass)\b/.test(c)) return "password";
+    if (type === "url" || /\b(web\s*site|website|homepage|home\s*page|site\s*url|url|web\s*address)\b/.test(c)) return "website";
+    if (/\b(company|organi[sz]ation|business|employer|firm)\b/.test(c)) return "company";
     if (/\b(first|given)\s*name\b|\bfname\b/.test(c)) return "firstName";
     if (/\b(last|family|sur)\s*name\b|\blname\b/.test(c)) return "lastName";
     if (/\b(full\s*name|your\s*name|name)\b/.test(own)) return "fullName";
@@ -420,6 +440,73 @@
     if (/\b(country|nation)\b/.test(c)) return "country";
     if (tag === "textarea" || /\b(message|comment|description)\b/.test(own)) return "message";
     return "text";
+  }
+
+  // ---- v27: pickers whose trigger shows only the current value ("India", "INR") ----
+  const COUNTRY_NAMES = new Set("afghanistan,albania,algeria,andorra,angola,argentina,armenia,australia,austria,azerbaijan,bahamas,bahrain,bangladesh,barbados,belarus,belgium,belize,benin,bhutan,bolivia,bosnia and herzegovina,botswana,brazil,brunei,bulgaria,burkina faso,burundi,cambodia,cameroon,canada,cape verde,chad,chile,china,colombia,comoros,congo,costa rica,croatia,cuba,cyprus,czech republic,czechia,denmark,djibouti,dominican republic,ecuador,egypt,el salvador,estonia,eswatini,ethiopia,fiji,finland,france,gabon,gambia,georgia,germany,ghana,greece,guatemala,guinea,guyana,haiti,honduras,hong kong,hungary,iceland,india,indonesia,iran,iraq,ireland,israel,italy,ivory coast,jamaica,japan,jordan,kazakhstan,kenya,kosovo,kuwait,kyrgyzstan,laos,latvia,lebanon,lesotho,liberia,libya,liechtenstein,lithuania,luxembourg,macau,madagascar,malawi,malaysia,maldives,mali,malta,mauritania,mauritius,mexico,moldova,monaco,mongolia,montenegro,morocco,mozambique,myanmar,namibia,nepal,netherlands,new zealand,nicaragua,niger,nigeria,north macedonia,norway,oman,pakistan,palestine,panama,papua new guinea,paraguay,peru,philippines,poland,portugal,puerto rico,qatar,romania,russia,rwanda,saudi arabia,senegal,serbia,seychelles,sierra leone,singapore,slovakia,slovenia,somalia,south africa,south korea,korea,south sudan,spain,sri lanka,sudan,suriname,sweden,switzerland,syria,taiwan,tajikistan,tanzania,thailand,togo,trinidad and tobago,tunisia,turkey,turkiye,turkmenistan,uganda,ukraine,united arab emirates,uae,united kingdom,uk,united states,usa,us,uruguay,uzbekistan,venezuela,vietnam,viet nam,yemen,zambia,zimbabwe".split(","));
+  const CURRENCY_CODES = new Set("AED,AFN,ALL,AMD,ARS,AUD,AZN,BAM,BDT,BGN,BHD,BRL,BWP,BYN,CAD,CHF,CLP,CNY,COP,CRC,CZK,DKK,DZD,EGP,ETB,EUR,GBP,GEL,GHS,HKD,HRK,HUF,IDR,ILS,INR,IQD,IRR,ISK,JMD,JOD,JPY,KES,KGS,KHR,KRW,KWD,KZT,LAK,LBP,LKR,MAD,MDL,MKD,MMK,MNT,MUR,MXN,MYR,NGN,NOK,NPR,NZD,OMR,PEN,PHP,PKR,PLN,PYG,QAR,RON,RSD,RUB,SAR,SEK,SGD,THB,TND,TRY,TWD,TZS,UAH,UGX,USD,UYU,UZS,VES,VND,XAF,XOF,ZAR,ZMW,BTC,ETH,USDT".split(","));
+  function knownPickerType(el) {
+    try {
+      const raw = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      if (!raw || raw.length > 40) return "";
+      const r = el.getBoundingClientRect();
+      if (r.width > 520 || r.height > 140) return "";
+      let letters = raw.replace(/\([^)]*\)/g, " ").replace(/\+\s*\d+/g, " ").replace(/[^\p{L}\s.'-]/gu, " ").replace(/\s+/g, " ").trim();
+      // a stray one-letter token is a chevron / icon glyph ("India v", "INR ^")
+      letters = letters.split(" ").filter(function (t, i, a) { return !(t.length === 1 && a.length > 1); }).join(" ");
+      const low = letters.toLowerCase().replace(/\.$/, "");
+      if (low && COUNTRY_NAMES.has(low)) return "country";
+      const toks = letters.split(" ").filter(Boolean);
+      if (toks.length === 1 && /^[A-Za-z]{3}$/.test(toks[0]) && CURRENCY_CODES.has(toks[0].toUpperCase()) && toks[0] === toks[0].toUpperCase()) return "currency";
+    } catch (_) {}
+    return "";
+  }
+  function isCloseLike(el) {
+    try {
+      const txt = (el.innerText || el.textContent || "").replace(/\s+/g, "").trim();
+      if (/^(\u00d7|\u2715|\u2716|\u2573|x|X|close|cancel|done)$/i.test(txt)) return true;
+      const attrs = [el.getAttribute("aria-label"), el.getAttribute("title"), el.id, typeof el.className === "string" ? el.className : "", el.getAttribute("data-testid")].filter(Boolean).join(" ");
+      if (/(^|[\s_-])(close|dismiss|cancel|clear)([\s_-]|$)/i.test(attrs)) return true;
+      // icon-only control in the top-right corner of its popup
+      if (!txt && el.querySelector && el.querySelector("svg,img,i")) {
+        const pop = el.closest("[role='dialog'],[aria-modal='true'],[class*='modal' i],[class*='popup' i],[class*='sheet' i],[class*='drawer' i],[class*='picker' i]");
+        if (pop) {
+          const a = el.getBoundingClientRect(), b = pop.getBoundingClientRect();
+          return a.top - b.top < b.height * 0.25 && b.right - a.right < b.width * 0.25;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+  function insidePopup(el) {
+    try {
+      if (el.closest("[role='dialog'],[role='listbox'],[role='menu'],[aria-modal='true'],[class*='modal' i],[class*='popup' i],[class*='dropdown' i],[class*='sheet' i],[class*='drawer' i],[class*='picker' i],[class*='overlay' i]")) return true;
+      // a floating layer (fixed / absolute) a few levels up
+      let n = el.parentElement;
+      for (let d = 0; n && d < 6; d++, n = n.parentElement) {
+        const pos = getComputedStyle(n).position;
+        if (pos === "fixed" || pos === "absolute") return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+  // something clickable among the ancestors that has a JS click handler but no tag/role/cursor that says so
+  function hasClickHandler(el) {
+    try {
+      if (window.__ddgClicky && window.__ddgClicky.has(el)) {
+        const r = el.getBoundingClientRect();
+        if (r.width * r.height < (window.innerWidth * window.innerHeight) * 0.4) return true;
+      }
+      if (typeof el.onclick === "function") return true;
+      const ks = Object.keys(el);
+      for (let i = 0; i < ks.length; i++) {
+        const k = ks[i];
+        if (/^__reactProps\$|^__reactEventHandlers\$/.test(k) && el[k] && typeof el[k].onClick === "function") return true;
+      }
+      if (el._vei && (el._vei.onClick || el._vei.onclick)) return true;
+      if (window.jQuery && window.jQuery._data) { const ev = window.jQuery._data(el, "events"); if (ev && ev.click) return true; }
+    } catch (_) {}
+    return false;
   }
 
   function splitWords(v) {
@@ -450,6 +537,16 @@
     const canInherit = optionLike && tag !== "input" && tag !== "textarea" && tag !== "select" && tag !== "button";
     const fresh = canInherit && Date.now() - lastFieldContextAt < 15000 ? lastFieldContext : "";
 
+    // v27: a trigger that only shows its current value ("India", "INR") is the country / currency picker
+    if (!optionLike && !listPopup && tag !== "input" && tag !== "textarea" && tag !== "select") {
+      const kp = knownPickerType(el);
+      if (kp) return kp;
+    }
+    // class names and the surrounding text only describe real FIELDS; a close icon or a button must not
+    // inherit "country" from the title of the popup it sits in
+    const fieldLike = tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable ||
+      ["textbox", "combobox", "listbox", "searchbox", "spinbutton", "checkbox", "radio", "switch"].indexOf(role) !== -1 ||
+      pickerish;
     // 1) the element's own label / name / placeholder, 2) plus its class names, 3) plus its tight surrounding label.
     let r = classifyCore(el, strong + " " + fresh, "", fresh);
     if (r !== "text" || buttonLike && !pickerish) {
@@ -458,6 +555,7 @@
           !(r === "countryCode" && /^\+\d{1,4}$/.test((el.innerText || el.textContent || "").replace(/\s+/g, "")))) return "text";
       return r;
     }
+    if (!fieldLike) return "text";
     r = classifyCore(el, ownAll + " " + fresh, "", fresh);
     if (r !== "text") return r;
     const tight = localContext(el, true).toLowerCase();
@@ -653,6 +751,28 @@
       }
     }
 
+    // v27: icons (svg/span) inside a control whose handler is plain JS: walk up further, look for a click handler,
+    // a pointer cursor, or a button-ish class; never pick something that fills the whole page
+    if (!actual) {
+      const vw = window.innerWidth || 1, vh = window.innerHeight || 1;
+      for (let i = 0; i < Math.min(path.length, 12); i++) {
+        const el = path[i];
+        if (!el || el === document.documentElement || el === document.body) break;
+        try {
+          if (isPopupShell(el)) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width >= vw * 0.95 && r.height >= vh * 0.6) break;
+          const cls = (typeof el.className === "string" ? el.className : (el.getAttribute && el.getAttribute("class")) || "").toLowerCase();
+          const st = getComputedStyle(el);
+          if (hasClickHandler(el) || st.cursor === "pointer" ||
+              /(^|[\s_-])(btn|button|icon-?btn|clickable|trigger|toggle)([\s_-]|$)/.test(cls) ||
+              /(button|btn|icon)/i.test(el.getAttribute("data-testid") || "") || el.hasAttribute("aria-label") && st.cursor !== "default" && r.width < 120) {
+            actual = el; break;
+          }
+        } catch (_) {}
+      }
+    }
+
     if (!actual) {
       for (let i = 0; i < Math.min(path.length, 5); i++) {
         const el = path[i];
@@ -705,6 +825,10 @@
       if (!isVisible(actual) && !isBoxy(actual)) { ignore("IGNORED (" + src + "): not visible " + describe(actual), actual); return; }
 
       const now = Date.now();
+      // v27: the X / close icon of a "Choose country" style popup is not a step
+      if (now - lastPickerAt < 60000 && isCloseLike(actual) && insidePopup(actual)) {
+        ignore("IGNORED (" + src + "): closing a picker list", actual); return;
+      }
       if (actual === lastTarget && now - lastTime < (isTextField(actual) ? 1200 : 500)) { return; }
       lastTarget = actual;
       lastTime = now;
@@ -720,6 +844,11 @@
         lastFieldContextAt = Date.now();
       }
       const isDatePart = ["dob", "dobYear", "dobMonth", "dobDay"].indexOf(inferredType) !== -1;
+      if (["country", "countryCode", "currency", "state"].indexOf(inferredType) !== -1 && !isTextField(actual)) {
+        // the same picker tapped again (to close it, or to re-open it) is still ONE step
+        if (lastPickerEl === actual && now - lastPickerAt < 20000) { ignore("IGNORED (" + src + "): same picker tapped again", actual); return; }
+        lastPickerEl = actual; lastPickerAt = now;
+      }
       // v21: "state" added so custom state/province dropdowns are Fields, not ClickNext
       const isSemanticPicker = ["country", "countryCode", "currency", "state"].indexOf(inferredType) !== -1;
       const isFieldLike =

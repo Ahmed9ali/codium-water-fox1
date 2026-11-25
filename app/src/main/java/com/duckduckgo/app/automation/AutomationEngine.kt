@@ -508,6 +508,8 @@ object AutomationEngine {
     /** [slot] is the data pool of this field: "dob" for the first date of birth on a page, "dob2" for the second... */
     private fun resolveFieldValue(step: RecordedStep, recurringProfile: ActiveAutomationProfile, defaultProfile: ActiveAutomationProfile?, slot: String = ""): String {
         if (step.customValue.isNotBlank()) return step.customValue
+        // terms / newsletter / consent boxes carry no data: the step just ticks them
+        if (step.fieldType.lowercase().let { it.endsWith("checkbox") || it == "checkbox" }) return "true"
         val looksLike = slot.ifBlank { VaultRepository.slotKey(step.fieldType) }
         val occurrence = 0
         val isDynamic = DYNAMIC_FIELDS.contains(VaultRepository.splitOrdinal(looksLike).first)

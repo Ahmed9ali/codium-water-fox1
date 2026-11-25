@@ -124,6 +124,38 @@
     for (var i = 0; i < pool.length; i++) { if (!pool.some(function (o) { return o !== pool[i] && pool[i].contains(o); })) { best = pool[i]; break; } }
     return best.closest("button,[role=button],[role=combobox],[aria-haspopup]") || best;
   }
+  function checkLike(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var t = lower(el.type), r = lower(el.getAttribute("role"));
+    return t === "checkbox" || t === "radio" || r === "checkbox" || r === "switch" || r === "radio";
+  }
+  // a custom-styled checkbox hides the real <input> (opacity 0 / 1px): its label or wrapper is what is on screen
+  function visibleLoose(el) {
+    if (visible(el)) return true;
+    if (!checkLike(el) || !el.isConnected) return false;
+    var labs = el.labels ? Array.prototype.slice.call(el.labels) : [];
+    return labs.some(visible) || visible(el.parentElement) || (el.parentElement && visible(el.parentElement.parentElement));
+  }
+  function isChecked(el) {
+    if (typeof el.checked === "boolean" && lower(el.tagName) === "input") return el.checked;
+    var a = el.getAttribute("aria-checked");
+    return a === "true";
+  }
+  async function setChecked(el, want, p) {
+    if (isChecked(el) === want) return { ok: true, via: "already set" };
+    var targets = [el];
+    if (el.labels && el.labels[0]) targets.push(el.labels[0]);
+    if (el.parentElement) targets.push(el.parentElement);
+    for (var i = 0; i < targets.length; i++) {
+      try { if (i === 0 && lower(el.tagName) === "input") el.click(); else synthClick(targets[i]); } catch (_) {}
+      await sleep(300);
+      if (isChecked(el) === want) return { ok: true };
+    }
+    // the page ignores dispatched clicks: ask the engine for a real tap on the visible box
+    var vis = [el.labels && el.labels[0], el.parentElement, el].filter(function (x) { return x && visible(x); })[0] || el;
+    g.__ddgPick = { check: el, want: want, label: "checkbox" };
+    return { ok: false, err: "the checkbox did not change", native: nativeInfo(vis), stage: "option" };
+  }
   function findElement(p) {
     var tries = [
       function () { return p.id ? document.getElementById(p.id) : null; },
@@ -132,7 +164,7 @@
       function () { return p.name ? document.getElementsByName(p.name)[0] : null; }
     ];
     for (var i = 0; i < tries.length; i++) {
-      try { var el = tries[i](); if (visible(el)) return el; } catch (_) {}
+      try { var el = tries[i](); if (visibleLoose(el)) return el; } catch (_) {}
     }
     var all = deepAll(FIELD_SEL).filter(visible);
     if (p.fieldType === "countrycode") {
@@ -511,6 +543,7 @@
     var pk = g.__ddgPick;
     if (!pk) return J({ ok: false, err: "nothing to verify" });
     await sleep(300);
+    if (pk.check) return isChecked(pk.check) === pk.want ? J({ ok: true, via: "real tap" }) : J({ ok: false, err: "a real tap did not change the checkbox" });
     if (settled(pk.p, pk.found)) return J({ ok: true, via: "real tap" });
     var live = findElement(pk.p);
     return J({ ok: false, err: 'a real tap on "' + pk.label + '" did not change the field (it shows "' + (live ? text(live).slice(0, 20) : "?") + '")' });
@@ -523,6 +556,11 @@
     if (!el) return J({ ok: false, err: "field not found" });
     try {
       var tag = lower(el.tagName), type = lower(el.type), wanted = String(p.wanted == null ? "" : p.wanted);
+      if (checkLike(el)) {
+        // ticking a box (terms, newsletter...) needs no stored data
+        var wantTick = !/^(false|0|no|off|untick|uncheck)$/i.test(wanted.trim());
+        return J(await setChecked(el, wantTick, p));
+      }
       var isNative = tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable;
       var isCustom = !isNative || el.matches(CUSTOM_SEL);
       if (isCustom) return J(await chooseCustom(el, p));
