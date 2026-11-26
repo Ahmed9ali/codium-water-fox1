@@ -31,7 +31,8 @@ import com.duckduckgo.mobile.android.R.drawable
 private val PRESET_FIELD_TYPES = listOf(
     "email", "password", "confirmPassword", "fullName", "firstName",
     "lastName", "username", "phone", "message", "subject", "address",
-    "city", "zip", "country", "countryCode", "dob", "otp", "text",
+    "city", "zip", "country", "countryCode", "dob", "dob2", "dobDay", "dobMonth", "dobYear",
+    "company", "website", "jobTitle", "currency", "otp", "text",
 )
 
 @Composable
@@ -48,6 +49,7 @@ fun GroupDetailScreen(
 
     // State for "Add Specific Data" dialog
     var showAddDialog by remember { mutableStateOf(false) }
+    var showGenerator by remember { mutableStateOf(false) }
     var selectedFieldType by remember { mutableStateOf("email") }
     var customFieldType by remember { mutableStateOf("") }
     var newEntryValuesText by remember { mutableStateOf("") }
@@ -145,6 +147,14 @@ fun GroupDetailScreen(
                     },
                 )
 
+                Spacer(Modifier.height(10.dp))
+
+                // Generate random data for this group (email, phone, password, names, dob, country code...)
+                DdgSecondaryButton(
+                    text = "Generate data for '$groupName'",
+                    onClick = { showGenerator = true },
+                )
+
                 Spacer(Modifier.height(20.dp))
 
                 if (entries.isEmpty()) {
@@ -218,6 +228,15 @@ fun GroupDetailScreen(
                     }
                 }
             }
+        }
+
+        // MODAL 0: GENERATE RANDOM DATA (see DataGeneratorDialog.kt)
+        if (showGenerator) {
+            DataGeneratorDialog(
+                groupName = groupName,
+                onDismiss = { showGenerator = false },
+                onGenerated = { n -> Toast.makeText(context, "Added $n entries", Toast.LENGTH_SHORT).show() },
+            )
         }
 
         // MODAL 1: ADD SPECIFIC DATA

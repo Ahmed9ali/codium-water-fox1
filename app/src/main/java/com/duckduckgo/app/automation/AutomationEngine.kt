@@ -90,6 +90,8 @@ object AutomationEngine {
 
     // Picker-style controls that must always be recorded as Field steps, never as ClickNext.
     private val FORCE_FIELD_TYPES = setOf("country", "countrycode", "currency", "state", "dob", "dobyear", "dobmonth", "dobday")
+    /** Types the recorder knows but FieldTypeMapper may not: they are kept as they are instead of becoming "Assign". */
+    private val PASS_THROUGH_TYPES = setOf("website", "company", "choice")
 
     private var currentWebView: WeakReference<WebView>? = null
     // Every WebView that was ever attached (one per tab). currentWebView can point at a background tab,
@@ -510,6 +512,11 @@ object AutomationEngine {
         if (step.customValue.isNotBlank()) return step.customValue
         // terms / newsletter / consent boxes carry no data: the step just ticks them
         if (step.fieldType.lowercase().let { it.endsWith("checkbox") || it == "checkbox" }) return "true"
+        // a drop-down with no data type: the option that was picked while recording (a pool named like the field wins)
+        if (step.fieldType == "choice") {
+            val byName = recurringProfile.fieldByName(step.name) ?: defaultProfile?.fieldByName(step.name)
+            return byName ?: step.buttonLabel
+        }
         val looksLike = slot.ifBlank { VaultRepository.slotKey(step.fieldType) }
         val occurrence = 0
         val isDynamic = DYNAMIC_FIELDS.contains(VaultRepository.splitOrdinal(looksLike).first)
@@ -651,6 +658,40 @@ object AutomationEngine {
         }
     }
 
+    /** A slow real drag (no fling) from (x, y) to (x, y2), CSS pixels: moves a wheel picker exactly that far. */
+    private suspend fun nativeSwipe(webView: WebView, n: JSONObject): Boolean {
+        val density = webView.resources.displayMetrics.density.toDouble()
+        val dpr = n.optDouble("dpr", density).takeIf { it > 0.0 } ?: density
+        val scale = n.optDouble("vs", 1.0).takeIf { it > 0.0 } ?: 1.0
+        val x = ((n.optDouble("x") - n.optDouble("vx", 0.0)) * scale * dpr).toFloat()
+        val y1 = ((n.optDouble("y") - n.optDouble("vy", 0.0)) * scale * dpr).toFloat()
+        val y2 = ((n.optDouble("y2") - n.optDouble("vy", 0.0)) * scale * dpr).toFloat()
+        return withContext(Dispatchers.Main) {
+            if (x.isNaN() || y1.isNaN() || y2.isNaN() || x < 0f || y1 < 0f || y2 < 0f || x > webView.width || y1 > webView.height || y2 > webView.height) {
+                Log.w(TAG, "nativeSwipe: ($x, $y1 -> $y2) is outside the WebView (${webView.width}x${webView.height})")
+                false
+            } else {
+                val downTime = SystemClock.uptimeMillis()
+                val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, y1, 0)
+                down.source = InputDevice.SOURCE_TOUCHSCREEN
+                webView.dispatchTouchEvent(down); down.recycle()
+                val steps = 10
+                for (i in 1..steps) {
+                    delay(35)
+                    val yy = y1 + (y2 - y1) * i / steps
+                    val mv = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE, x, yy, 0)
+                    mv.source = InputDevice.SOURCE_TOUCHSCREEN
+                    webView.dispatchTouchEvent(mv); mv.recycle()
+                }
+                delay(280)   // hold still before lifting: no fling
+                val up = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x, y2, 0)
+                up.source = InputDevice.SOURCE_TOUCHSCREEN
+                webView.dispatchTouchEvent(up); up.recycle()
+                true
+            }
+        }
+    }
+
     private suspend fun runFieldStep(webView: WebView, step: RecordedStep, value: String, humanize: Boolean): JSONObject {
         val host = frameHostOf(step)
         var verifyHost = host
@@ -672,9 +713,26 @@ object AutomationEngine {
             }
         }
 
+        // 1b) A wheel picker (day / month / year columns) that ignores dispatched clicks: real taps and drags move it,
+        //     the page script re-reads the wheel after every move and says what to do next.
+        var wheelRounds = 0
+        while (!res.optBoolean("ok", false) && res.optString("stage") == "wheel" && wheelRounds < 45) {
+            wheelRounds++
+            val sw = res.optJSONObject("swipe")
+            val tap = res.optJSONObject("native")
+            val acted = when {
+                sw != null -> nativeSwipe(webView, sw)
+                tap != null -> nativeTap(webView, tap)
+                else -> false
+            }
+            if (!acted) break
+            delay(650)
+            res = execStep(webView, "fill", fillParams(step, value, humanize), host)
+        }
+
         // 2) The page ignored dispatched clicks on the option: tap it for real, then check that the field changed.
         val nativeInfo = res.optJSONObject("native")
-        if (!res.optBoolean("ok", false) && nativeInfo != null && res.optString("stage") != "open") {
+        if (!res.optBoolean("ok", false) && nativeInfo != null && res.optString("stage") != "open" && res.optString("stage") != "wheel") {
             if (nativeTap(webView, nativeInfo)) {
                 delay(500)
                 val verdict = execStep(webView, "verify", JSONObject(), verifyHost)
@@ -712,11 +770,14 @@ object AutomationEngine {
             for ((i, st) in script.steps.withIndex()) {
                 if (st.kind != StepKind.Field || st.customValue.isNotBlank()) continue
                 val (base, explicit) = VaultRepository.splitOrdinal(st.fieldType)
+                if (st.fieldType.lowercase().endsWith("checkbox") || base == "choice") continue   // carry no stored data
                 val ord = if (explicit > 1) explicit else (seenOfType[base] ?: 0) + 1
                 if (explicit <= 1) seenOfType[base] = ord
                 val slot = if (ord > 1) base + ord else base
                 slotOf[i] = slot
-                needs[slot] = (needs[slot] ?: 0) + 1
+                // day / month / year selects of one date all draw from ONE entry of the "dob" (2nd date: "dob2") pool
+                val pool = if (base == "dobyear" || base == "dobmonth" || base == "dobday") "dob" + (if (ord > 1) ord.toString() else "") else slot
+                needs[pool] = 1
             }
             val activeProfile = VaultRepository.acquireMergedProfile(config.groupNames, config.mode, needs)
             if (activeProfile == null) {
@@ -780,8 +841,9 @@ object AutomationEngine {
                 val stepOk: Boolean = when (step.kind) {
                     StepKind.Field -> {
                         updateState(AutomationState.FILLING)
-                        updateStatus("Filling ${step.displayLabel}...")
                         val valToFill = resolveFieldValue(step, activeProfile, defaultProfile, slotOf[stepIdx])
+                        updateStatus("Filling ${step.displayLabel}" + (if (slotOf[stepIdx].isNotBlank()) " [${slotOf[stepIdx]}]" else "") + "...")
+                        Log.d(TAG, "field step ${stepIdx + 1}: type=${step.fieldType} slot=${slotOf[stepIdx]} value=$valToFill")
                         if (config.humanize) delay(Random.nextLong(500, 3000))
 
                         val res = runFieldStep(webView, step, valToFill, config.humanize)
@@ -1418,6 +1480,18 @@ object AutomationEngine {
         try {
             val obj = JSONObject(json)
             val kindRaw = obj.optString("kind", "Field")
+            // the person picked an option in a recorded drop-down AFTER tapping it: remember what was chosen
+            if (kindRaw.equals("update", ignoreCase = true) && obj.optString("op") == "choice") {
+                val fh = sanitizeString(obj.optString("frameHost", ""), 120)
+                val css = sanitizeString(obj.optString("cssSelector", ""), 500)
+                val key = if (fh.isNotBlank()) "$FRAME_PREFIX$fh$FRAME_SUFFIX$css" else css
+                val chosen = sanitizeString(obj.optString("chosen", ""), 90)
+                val target = hudRecordedSteps.lastOrNull { it.kind == StepKind.Field && it.fieldType == "choice" && it.cssSelector == key }
+                if (target == null || chosen.isBlank()) { ackRecorder(seq, false, "no choice step to update"); return }
+                hudRecordedSteps = hudRecordedSteps.map { if (it.id == target.id) it.copy(buttonLabel = chosen) else it }
+                ackRecorder(seq, true, "choice: $chosen")
+                return
+            }
             val looksLike = sanitizeString(obj.optString("looksLike", ""), 50)
 
             // Picker-style controls (country, country code, currency, state, DOB parts) are always Fields,
@@ -1463,16 +1537,26 @@ object AutomationEngine {
             }
             lastRecordedAt = now
 
-            val plainType = if (stepKind == StepKind.Field) FieldTypeMapper.normalizeLooksLike(looksLike) else ""
+            val plainType = when {
+                stepKind != StepKind.Field -> ""
+                looksLike.lowercase() in PASS_THROUGH_TYPES -> looksLike.lowercase()
+                else -> FieldTypeMapper.normalizeLooksLike(looksLike)
+            }
             // A second field of the same type on this page becomes "dob2", "email2"...: it has its own data pool.
             val sameBefore = if (plainType.isBlank()) 0 else hudRecordedSteps.count {
                 it.kind == StepKind.Field && VaultRepository.splitOrdinal(it.fieldType).first == VaultRepository.splitOrdinal(plainType).first
             }
             val ordinal = sameBefore + 1
-            val canonicalType = if (ordinal in 2..9) plainType + ordinal else plainType
-            var rawLabel = if (stepKind == StepKind.ClickNext) obj.optString("buttonLabel", "Next button")
-                           else FieldTypeMapper.fieldRowLabel(plainType, obj.optString("displayLabel", ""))
-            if (ordinal in 2..9 && stepKind == StepKind.Field) {
+            val canonicalType = if (ordinal in 2..9 && plainType != "choice") plainType + ordinal else plainType
+            val chosenNow = sanitizeString(obj.optString("chosen", ""), 90)
+            var rawLabel = when {
+                stepKind == StepKind.ClickNext -> obj.optString("buttonLabel", "Next button")
+                plainType == "website" -> "Website Input"
+                plainType == "company" -> "Company Input"
+                plainType == "choice" -> "Choose " + obj.optString("displayLabel", "option").replace(Regex("([a-z])([A-Z])"), "$1 $2").replace(Regex("[_-]+"), " ").trim()
+                else -> FieldTypeMapper.fieldRowLabel(plainType, obj.optString("displayLabel", ""))
+            }
+            if (ordinal in 2..9 && stepKind == StepKind.Field && plainType != "choice") {
                 rawLabel = if (rawLabel.endsWith(" Input")) rawLabel.removeSuffix(" Input") + " $ordinal Input" else "$rawLabel $ordinal"
             }
             val displayLabel = sanitizeString(rawLabel, 100)
@@ -1490,7 +1574,7 @@ object AutomationEngine {
                 cssSelector = storedCss,
                 xpath = xpathVal,
                 index = obj.optInt("index", -1),
-                buttonLabel = sanitizeString(obj.optString("buttonLabel"), 100),
+                buttonLabel = if (canonicalType == "choice") chosenNow else sanitizeString(obj.optString("buttonLabel"), 100),
                 verified = stepKind != StepKind.Field || canonicalType.isNotBlank(),
             )
             hudRecordedSteps = hudRecordedSteps + step

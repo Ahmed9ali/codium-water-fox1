@@ -34,6 +34,12 @@ data class ActiveAutomationProfile(
     /** Every value taken for a type, in order: the 2nd field of the same type on a page uses the 2nd value. */
     val lists: Map<String, List<String>> = emptyMap(),
 ) {
+    /** Exact pool named like a page field ("monthlyvolume"), no guessing. */
+    fun fieldByName(name: String): String? {
+        if (name.isBlank()) return null
+        return fields[VaultRepository.normalizeFieldKey(name)]?.takeIf { it.isNotBlank() }
+    }
+
     fun resolveForField(looksLike: String, fieldName: String = "", tag: String = "", occurrence: Int = 0): String? {
         // "dob2" = the second date-of-birth field of a page. It has its own pool ("dob2" entries); when there is none,
         // it takes the second value of the plain pool, never the same value as the first field.
@@ -41,6 +47,14 @@ data class ActiveAutomationProfile(
         if (ordinal > 1) {
             fields[baseKey + ordinal]?.let { if (it.isNotBlank()) return it }
             lists[baseKey]?.getOrNull(ordinal - 1)?.let { if (it.isNotBlank()) return it }
+            // 2nd date of birth: day / month / year come out of the "dob2" value (or the 2nd plain "dob" value).
+            // They are NEVER taken from the first date: two dates of birth must differ.
+            val part = when (baseKey) { "dobyear" -> 'y'; "dobmonth" -> 'm'; "dobday" -> 'd'; else -> null }
+            if (part != null) {
+                val src = fields["dob$ordinal"] ?: lists["dob"]?.getOrNull(ordinal - 1)
+                return datePartOfDob(src, part)
+            }
+            if (baseKey == "dob") return null
         }
         val normalizedType = baseKey
 
@@ -184,6 +198,18 @@ object VaultRepository {
         save()
     }
 
+    /**
+     * Adds already-made values (see [DataGenerator]) to a group WITHOUT parsing them: a value such as "10:30" or
+     * "https://x.com" must stay one value, and every entry gets exactly [fieldType] ("dob2" keeps its pool).
+     */
+    fun addGeneratedEntries(groupName: String, fieldType: String, values: List<String>) {
+        val key = slotKey(fieldType)
+        val fresh = values.map { it.trim() }.filter { it.isNotEmpty() }.map { repairEntry(VaultEntry(fieldType = key, value = it, used = false), groupName) }
+        if (fresh.isEmpty()) return
+        groups.value = groups.value.map { g -> if (g.name == groupName) g.copy(entries = g.entries + fresh) else g }
+        save()
+    }
+
     fun updateEntry(groupName: String, index: Int, newFieldType: String, newValue: String) {
         val normalizedType = slotKey(newFieldType)
         groups.value = groups.value.map { g ->
@@ -310,6 +336,13 @@ object VaultRepository {
         val consumed = mutableMapOf<String, List<Int>>()
         var anyFound = false
 
+        // every pool ("dob", "dob2", "email"...) that still has an unused entry in at least one selected group
+        val poolsPresent = mutableSetOf<String>()
+        for (name in groupNames) {
+            val g = getGroup(name) ?: continue
+            g.entries.forEach { e -> if (!e.used && e.value.isNotBlank()) poolsPresent.add(effectiveType(e, g.name)) }
+        }
+
         for (name in groupNames) {
             val group = getGroup(name) ?: continue
             val indexedUnused = group.entries.mapIndexedNotNull { index, entry ->
@@ -325,10 +358,11 @@ object VaultRepository {
             }
 
             // a "dob2" field with no "dob2" pool in this group borrows the next entry of the plain "dob" pool
+            // (only when NO selected group has an unused "dob2" entry; a used-up "Dob2" group counts as missing)
             val extra = mutableMapOf<String, Int>()
             for (nk in needs.keys) {
                 val (b, o) = splitOrdinal(nk)
-                if (o > 1 && byType[nk].isNullOrEmpty()) extra[b] = (extra[b] ?: 0) + 1
+                if (o > 1 && nk !in poolsPresent) extra[b] = (extra[b] ?: 0) + 1
             }
             val groupConsumed = mutableListOf<Int>()
             val maxBucketSize = byType.values.maxOfOrNull { it.size } ?: 1

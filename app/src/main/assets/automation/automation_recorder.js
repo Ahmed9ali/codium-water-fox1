@@ -1,5 +1,5 @@
 /*
- * Automation Recorder v27
+ * Automation Recorder v28
  *
  * v23: records inside iframes. The recorder now runs in every frame (document-start script), a child frame posts each
  *      captured tap to the top page with postMessage, the top page queues it for Kotlin and sends the result back so the
@@ -23,7 +23,7 @@
 (function () {
   "use strict";
   const g = globalThis;
-  const VERSION = "v27";
+  const VERSION = "v28";
   const DEBUG = true;
 
   function log() {
@@ -87,6 +87,8 @@
 
   let lastTarget = null;
   let lastPickerEl = null, lastPickerAt = 0;
+  let lastWheelCol = null, lastWheelAt = 0;
+  const wheelSeen = new WeakMap();   // column -> time it was recorded
   let lastTime = 0;
   let lastFieldContext = "";
   let lastFieldContextAt = 0;
@@ -716,6 +718,143 @@
     } catch (_) { return false; }
   }
 
+
+  // ---- v28: a big wrapper (login modal, card) is never "the button" ----
+  const NATIVE_CTRL = "input,textarea,select,button,a,summary,label,[role='button'],[role='link']";
+  function containerish(el) {
+    try {
+      if (el.matches("input,textarea,select,button,a,summary,label,[role='button'],[role='link'],[role='checkbox'],[role='radio'],[role='switch'],[role='combobox'],[role='textbox'],[role='option'],[role='tab'],[role='menuitem']")) return false;
+      const t = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      if (t.length > 160) return true;
+      const n = el.querySelectorAll(NATIVE_CTRL).length;
+      if (n >= 3) return true;
+      const r = el.getBoundingClientRect();
+      return r.width >= (window.innerWidth || 1) * 0.9 && r.height >= (window.innerHeight || 1) * 0.5;
+    } catch (_) { return false; }
+  }
+  // text that is short enough to be a button caption: the tapped leaf's own text beats a wrapper's whole text
+  function shortCaption(label, leaf) {
+    label = (label || "").replace(/\s+/g, " ").trim();
+    if (label.length <= 50) return label;
+    try {
+      const t = ((leaf && (leaf.innerText || leaf.textContent)) || "").replace(/\s+/g, " ").trim();
+      if (t && t.length <= 50) return t;
+    } catch (_) {}
+    return label.slice(0, 47) + "…";
+  }
+
+  // ---- v28: wheel pickers (day / month / year columns, the centred value is the chosen one) ----
+  function dateToken(t) {
+    t = (t || "").replace(/\s+/g, " ").trim();
+    return t.length > 0 && t.length <= 12 && (/^\d{1,4}$/.test(t) || (MONTH_RX.test(t) && /^[A-Za-z]+\.?$/.test(t)));
+  }
+  function dateLeaves(root) {
+    const out = [];
+    let all;
+    try { all = root.querySelectorAll("*"); } catch (_) { return out; }
+    if (all.length > 400) return out;
+    for (let i = 0; i < all.length; i++) {
+      const n = all[i];
+      let kidText = false;
+      for (let k = 0; k < n.children.length; k++) { if ((n.children[k].textContent || "").trim()) { kidText = true; break; } }
+      if (kidText) continue;
+      const t = (n.textContent || "").trim();
+      if (!dateToken(t)) continue;
+      const r = n.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      out.push({ el: n, t: t, cx: r.left + r.width / 2, cy: r.top + r.height / 2 });
+    }
+    return out;
+  }
+  function stacked(leaves) {
+    if (leaves.length < 3) return false;
+    const xs = leaves.map(function (l) { return l.cx; }), ys = leaves.map(function (l) { return Math.round(l.cy); });
+    return Math.max.apply(null, xs) - Math.min.apply(null, xs) < 60 && new Set(ys).size >= 3;
+  }
+  function columnShape(leaves) {
+    const ts = leaves.map(function (l) { return l.t; });
+    if (ts.some(function (t) { return MONTH_RX.test(t) && /^[A-Za-z]/.test(t); })) return "month";
+    const nums = ts.map(Number);
+    if (nums.some(function (n) { return n >= 1000; })) return "year";
+    if (nums.every(function (n) { return n < 100; }) && nums.length >= 3 && nums.some(function (n) { return n >= 13; })) return nums.some(function (n) { return n >= 32; }) ? "year2" : "day";
+    return "";   // 1..12: month or day, decided by the neighbouring columns
+  }
+  function wheelDetect(path) {
+    let item = null;
+    for (let i = 0; i < Math.min(3, path.length); i++) {
+      const el = path[i];
+      if (!el || el.nodeType !== 1) continue;
+      const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+      if (!t) continue;
+      if (dateToken(t)) item = el;
+      break;
+    }
+    let col = null, leaves = null;
+    if (item) {
+      let cur = item.parentElement;
+      for (let d = 0; cur && d < 5 && cur !== document.body; d++, cur = cur.parentElement) {
+        const lv = dateLeaves(cur);
+        if (lv.length >= 3) { col = cur; leaves = lv; break; }
+        if (lv.length === 0 && d > 0) break;
+      }
+    } else {
+      // pointer capture / scroll handlers often retarget the tap to the column itself ("2005 2004 2003 2002 2001")
+      for (let i = 0; i < Math.min(3, path.length); i++) {
+        const el = path[i];
+        if (!el || el.nodeType !== 1) continue;
+        const t = (el.innerText || "").replace(/\s+/g, " ").trim();
+        if (!t) continue;
+        const toks = t.split(" ");
+        if (toks.length >= 3 && toks.length <= 12 && toks.every(dateToken)) {
+          const lv = dateLeaves(el);
+          if (lv.length >= 3) { col = el; leaves = lv; item = el; }
+        }
+        break;
+      }
+    }
+    if (!col) return null;
+    if (!col || leaves.length > 12 || !stacked(leaves)) return null;   // a calendar grid has 28+ numbers / rows are horizontal
+    // the picker must be about a date of birth
+    let ctx = "", n = col;
+    for (let d = 0; n && d < 8 && n !== document.body; d++, n = n.parentElement) {
+      const t = (n.innerText || "").replace(/\s+/g, " ");
+      if (t.length > 1500) break;
+      ctx = t;
+    }
+    const sibling = [];
+    // columns next to this one: leaf groups of the nearest ancestor that holds 2+ columns
+    let grp = col.parentElement, groupLeaves = null;
+    for (let d = 0; grp && d < 4 && grp !== document.body; d++, grp = grp.parentElement) {
+      const lv = dateLeaves(grp);
+      if (lv.length > 40) break;
+      const xs = []; lv.forEach(function (l) { if (!xs.some(function (x) { return Math.abs(x - l.cx) < 40; })) xs.push(l.cx); });
+      if (xs.length >= 2) { groupLeaves = lv; break; }
+    }
+    const cols = [];   // [{cx, leaves, shape}]
+    (groupLeaves || leaves).forEach(function (l) {
+      let c = cols.filter(function (c) { return Math.abs(c.cx - l.cx) < 40; })[0];
+      if (!c) { c = { cx: l.cx, leaves: [], shape: "" }; cols.push(c); }
+      c.leaves.push(l);
+    });
+    cols.sort(function (a, b) { return a.cx - b.cx; });
+    cols.forEach(function (c) { c.shape = columnShape(c.leaves); if (c.shape === "year2") c.shape = "year"; });
+    const mine = cols.filter(function (c) { return c.leaves.some(function (l) { return l.el === item || l.el.contains(item) || item.contains(l.el) || col.contains(l.el); }); })[0] || cols[0];
+    const hasBirth = /\b(birth|dob|born|date of birth|birthday)\b/i.test(ctx) || (lastFieldContextAt && Date.now() - lastFieldContextAt < 60000 && /dob|birth/.test(lastFieldContext));
+    const hasYearCol = cols.some(function (c) { return c.shape === "year"; });
+    if (!hasBirth && !(hasYearCol && cols.length >= 2)) return null;
+    // ambiguous 1..12 columns: day when the others already say month, otherwise left-to-right day, month, year
+    const taken = cols.map(function (c) { return c.shape; }).filter(Boolean);
+    const order = ["day", "month", "year"];
+    cols.forEach(function (c) {
+      if (c.shape) return;
+      const free = order.filter(function (o) { return taken.indexOf(o) === -1; });
+      c.shape = free.length ? free[0] : "month";
+      taken.push(c.shape);
+    });
+    const shape = mine.shape;
+    return { col: col, type: shape === "year" ? "dobYear" : shape === "month" ? "dobMonth" : "dobDay" };
+  }
+
   function resolveTarget(path) {
     let actual = null;
     for (let i = 0; i < path.length; i++) {
@@ -724,7 +863,7 @@
       try {
         if (isPopupShell(el)) continue;
         if (el.tagName === "LABEL" && el.control) { actual = el.control; break; }
-        if (el.matches(INTERACTIVE) || hasWidgetSemantics(el)) {
+        if ((el.matches(INTERACTIVE) || hasWidgetSemantics(el)) && !containerish(el)) {
           actual = el;
           if (el.id === "selectedCountry" || /hwid-selectedCountryName/i.test(String(el.className || ""))) {
             let owner = el.parentElement;
@@ -746,7 +885,7 @@
         try {
           if (isPopupShell(el)) continue;
           const st = getComputedStyle(el);
-          if (st.cursor === "pointer" || hasWidgetSemantics(el)) { actual = el; break; }
+          if ((st.cursor === "pointer" || hasWidgetSemantics(el)) && !containerish(el)) { actual = el; break; }
         } catch (_) {}
       }
     }
@@ -790,6 +929,27 @@
         }
       }
     }
+    // v28: nothing looked clickable but the person tapped it on purpose: a small text or icon leaf is a step, not a skip
+    if (!actual) {
+      for (let i = 0; i < Math.min(path.length, 3); i++) {
+        const el = path[i];
+        if (!el || el === document.documentElement || el === document.body || isPopupShell(el)) break;
+        try {
+          const r = el.getBoundingClientRect();
+          if (r.width > (window.innerWidth || 1) * 0.8 || r.height > 160 || r.width < 6 || r.height < 6) continue;
+          const tg = (el.tagName || "").toLowerCase();
+          const t = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+          const iconish = /^(svg|path|img|i|use|g)$/.test(tg);
+          if (iconish) {
+            const host = el.closest("svg") ? (el.closest("svg").parentElement || el.closest("svg")) : el;
+            const hr = host.getBoundingClientRect();
+            actual = hr.width <= 120 && hr.height <= 120 ? host : el;
+            break;
+          }
+          if (t && t.length <= 40 && !containerish(el)) { actual = el; break; }
+        } catch (_) {}
+      }
+    }
     if (!actual) return null;
 
     if (actual.tagName !== "A" && actual.tagName !== "BUTTON") {
@@ -820,7 +980,9 @@
         if (path[i].hasAttribute && path[i].hasAttribute("data-automation-hud")) { S.ignored++; log("IGNORED (" + src + "): HUD tap"); return; }
       }
 
-      const actual = resolveTarget(path);
+      let wheel = null;
+      try { wheel = wheelDetect(path); } catch (_) {}
+      const actual = wheel ? wheel.col : resolveTarget(path);
       if (!actual) { ignore("IGNORED (" + src + "): no interactive target, tapped " + describe(path[0]), path[0]); return; }
       if (!isVisible(actual) && !isBoxy(actual)) { ignore("IGNORED (" + src + "): not visible " + describe(actual), actual); return; }
 
@@ -838,7 +1000,14 @@
       const role = (actual.getAttribute("role") || "").toLowerCase();
       const semanticField = FIELD_ROLES.indexOf(role) !== -1 ||
         actual.matches("[aria-haspopup='listbox'],[aria-autocomplete],[data-datepicker],[data-date-picker],[data-type='fydeos_select'],.choose_value,#selectedCountry,.hwid-selectedCountryName,[id*='selectedCountry'],[class*='date-picker'],[class*='datepicker'],[class*='MuiSelect'],[class*='ant-select'],[class*='react-select']") || isCustomSelectLike(actual);
-      const inferredType = classify(actual);
+      if (wheel) {
+        if ((lastWheelCol === actual && now - lastWheelAt < 30000) || (wheelSeen.get(actual) && now - wheelSeen.get(actual) < 120000)) { ignore("IGNORED (" + src + "): same wheel tapped again", actual); return; }
+        lastWheelCol = actual; lastWheelAt = now; wheelSeen.set(actual, now);
+      }
+      let inferredType = wheel ? wheel.type : classify(actual);
+      // a drop-down with options that matches no data type ("monthly volume"): the step re-picks what was chosen now
+      const isChoice = !wheel && tag === "select" && inferredType === "text";
+      if (isChoice) inferredType = "choice";
       if (["dob", "dobYear", "dobMonth", "dobDay", "country", "countryCode", "currency"].indexOf(inferredType) !== -1) {
         lastFieldContext = inferredType.indexOf("dob") === 0 ? "date of birth dob" : inferredType;
         lastFieldContextAt = Date.now();
@@ -854,7 +1023,7 @@
       const isFieldLike =
         tag === "textarea" || tag === "select" ||
         (tag === "input" && CLICK_INPUT_TYPES.indexOf(type) === -1) ||
-        actual.isContentEditable || semanticField || isDatePart || isSemanticPicker;
+        actual.isContentEditable || semanticField || isDatePart || isSemanticPicker || isChoice;
       const kind = isFieldLike ? "Field" : "ClickNext";
 
       try {
@@ -877,7 +1046,8 @@
         }, 650);
       } catch (_) {}
 
-      const label = getLabel(actual);
+      const label = wheel ? "date wheel" : getLabel(actual);
+      const chosenNow = function (sel) { try { const o = sel.options[sel.selectedIndex]; return o ? (o.text || o.label || o.value || "").replace(/\s+/g, " ").trim().slice(0, 90) : ""; } catch (_) { return ""; } };
       const payload = {
         kind: kind, tag: tag, domType: type,
         name: actual.getAttribute("name") || "",
@@ -902,7 +1072,9 @@
         frameDepth: IS_TOP ? 0 : frameDepth(),
         frameUrl: IS_TOP ? "" : String(location.href).slice(0, 200),
         displayLabel: label || "Element",
-        buttonLabel: kind === "ClickNext" ? (label || "Button") : "",
+        wheel: !!wheel,
+        chosen: isChoice ? chosenNow(actual) : "",
+        buttonLabel: kind === "ClickNext" ? (shortCaption(label, path[0]) || "Button") : "",
         verified: true,
       };
       S.captured++;
@@ -911,6 +1083,19 @@
       S.pending.set(payload.seq, { el: actual, label: payload.displayLabel || tag });
       if (S.pending.size > 30) S.pending.delete(S.pending.keys().next().value);
       sendToBridge(payload, actual);
+
+      // the option is picked AFTER the tap: tell the step what was chosen
+      if (isChoice) {
+        const onPick = function () {
+          const upd = { kind: "Update", op: "choice", cssSelector: payload.cssSelector, xpath: payload.xpath, frameHost: payload.frameHost, frameDepth: payload.frameDepth, chosen: chosenNow(actual), seq: ++S.seq };
+          S.pending.set(upd.seq, { el: actual, label: "choice " + upd.chosen });
+          sendToBridge(upd, actual);
+        };
+        try {
+          actual.addEventListener("change", onPick);
+          setTimeout(function () { try { actual.removeEventListener("change", onPick); } catch (_) {} }, 120000);
+        } catch (_) {}
+      }
 
       if (isTextField(actual)) { try { actual.blur(); } catch (_) {} }
     } catch (err) {

@@ -99,7 +99,7 @@ object FieldTypeMapper {
         Option("address", "Address"), Option("city", "City"),
         Option("state", "State"), Option("zip", "Zip / Postal Code"),
         Option("country", "Country"), Option("countrycode", "Country Code"),
-        Option("company", "Company"), Option("jobtitle", "Job Title"),
+        Option("company", "Company"), Option("website", "Website"), Option("jobtitle", "Job Title"),
         Option("otp", "OTP / Verification Code"), Option("termscheckbox", "Terms / Agree Checkbox"),
         Option("text", "Text"),
     )
@@ -114,7 +114,7 @@ object FieldTypeMapper {
         "currency" to "currency", "gender" to "gender",
         "zip" to "zip", "city" to "city", "state" to "state", "country" to "country",
         "countrycode" to "countrycode", "address" to "address", "company" to "company",
-        "jobtitle" to "jobtitle", "phone" to "phone", "confirmphone" to "confirmphone",
+        "jobtitle" to "jobtitle", "website" to "website", "choice" to "choice", "phone" to "phone", "confirmphone" to "confirmphone",
         "otp" to "otp", "termscheckbox" to "termscheckbox", "text" to "text",
     )
 
@@ -122,7 +122,13 @@ object FieldTypeMapper {
 
     fun normalizeLooksLike(looksLike: String): String = looksLikeToCanonical[looksLike.trim().lowercase()] ?: ""
 
-    fun displayLabel(canonical: String): String = canonicalToLabel[canonical] ?: canonical.replaceFirstChar { it.uppercase() }
+    fun displayLabel(canonical: String): String {
+        canonicalToLabel[canonical]?.let { return it }
+        // "dob2", "email3": the label of the base type plus its number
+        val m = Regex("^([a-z]+)([2-9])$").find(canonical)
+        if (m != null) canonicalToLabel[m.groupValues[1]]?.let { return it + " " + m.groupValues[2] }
+        return canonical.replaceFirstChar { it.uppercase() }
+    }
 
     fun fieldRowLabel(canonical: String, fallback: String): String = when {
         canonical == "termscheckbox" -> "Terms Checkbox"

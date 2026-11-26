@@ -385,7 +385,8 @@
     if (label === target || val === target) return 0;
     if (p.fieldType === "countrycode") {
       var want = target.replace(/\D/g, "");
-      if (!want) return -1;
+      // a country NAME stored in the code pool ("malaysia"): match the row by its name
+      if (!want) return (label.indexOf(target) === 0 || label.indexOf(" " + target) >= 0 || label.indexOf(target) >= 0) ? 1 : -1;
       var nums = numbersOf(label);
       if (label === "+" + want) return 0;
       if (nums.length <= 3 && new RegExp("\\+\\s*" + want + "(?!\\d)").test(label)) return 1;
@@ -445,6 +446,26 @@
     };
   }
 
+  // The scrollable box that holds the option rows: the one containing the most option-like rows.
+  // (The LAST element of the page-wide option scan is often a footer, which has no scroll box at all.)
+  function listScroller(opts, trigger) {
+    var counts = [], boxes = [];
+    for (var i = 0; i < opts.length; i++) {
+      var t = text(opts[i]);
+      if (t.length > 60) continue;
+      var sc = scrollParent(opts[i]);
+      if (!sc) continue;
+      var k = boxes.indexOf(sc);
+      if (k < 0) { boxes.push(sc); counts.push(1); } else counts[k]++;
+    }
+    var best = null, bc = 0;
+    for (var j = 0; j < boxes.length; j++) {
+      var area = boxes[j].clientHeight * boxes[j].clientWidth;
+      if (counts[j] > bc || (counts[j] === bc && best && area < best.clientHeight * best.clientWidth)) { best = boxes[j]; bc = counts[j]; }
+    }
+    return bc >= 3 ? best : null;
+  }
+
   // Look for the wanted option in the list that is open NOW (trigger may be null: list rendered elsewhere).
   async function findInOpenList(p, trigger) {
     function notTrigger(o) { return !trigger || (o !== trigger && !trigger.contains(o)); }
@@ -457,16 +478,20 @@
       return opts;
     }
     var found = null, opts = [];
-    for (var i = 0; i < 15 && !found; i++) {
+    var stuck = 0, lastCount = -1;
+    for (var i = 0; i < 160 && !found; i++) {
       opts = scan();
       found = pickOption(opts, p);
       if (found) break;
-      var sc = opts.length ? scrollParent(opts[opts.length - 1]) : null;
+      var sc = listScroller(opts, trigger);
       if (!sc) break;
-      var prevTop = sc.scrollTop;
-      sc.scrollTop += Math.max(200, sc.clientHeight * 0.8);
-      await sleep(200);
-      if (sc.scrollTop === prevTop) break;
+      var prevTop = sc.scrollTop, prevCount = opts.length;
+      // one full window per step: long lists (240 countries) render more rows only while they are scrolled
+      sc.scrollTop += Math.max(240, sc.clientHeight * 0.95);
+      try { sc.dispatchEvent(new (sc.ownerDocument.defaultView.Event)("scroll", { bubbles: true })); } catch (_) {}
+      await sleep(i < 4 ? 160 : 110);
+      if (sc.scrollTop === prevTop) { if (++stuck >= 3) break; await sleep(250); } else stuck = 0;
+      lastCount = prevCount;
     }
     if (found) return found;
     // a search box inside the list: type the wanted value to filter it
@@ -549,6 +574,126 @@
     return J({ ok: false, err: 'a real tap on "' + pk.label + '" did not change the field (it shows "' + (live ? text(live).slice(0, 20) : "?") + '")' });
   }
 
+  // ------------------------------------------------------------------ wheel pickers (day / month / year columns)
+  // A column of stacked numbers (23 24 [25] 26 27) in which the centred one is selected. The recorded target is the
+  // COLUMN, because its items change every time it moves.
+  function wheelNum(t, kind) {
+    t = lower(t).trim();
+    if (!t) return null;
+    if (kind === "m") { var mi = MONTHS.indexOf(t.slice(0, 3)); if (mi >= 0 && /^[a-z]/.test(t)) return mi + 1; }
+    if (!/^\d{1,4}(st|nd|rd|th)?$/.test(t)) return null;
+    var n = parseInt(t, 10);
+    if (kind === "y" && n < 100) n += n > 30 ? 1900 : 2000;
+    return n;
+  }
+  function wheelItems(col, kind) {
+    var out = [], all;
+    try { all = Array.prototype.slice.call(col.querySelectorAll("*")); } catch (_) { return out; }
+    var doc = col.ownerDocument;
+    for (var i = 0; i < all.length; i++) {
+      var n = all[i];
+      var hasKidText = Array.prototype.some.call(n.children || [], function (c) { return text(c); });
+      if (hasKidText) continue;
+      var t = text(n);
+      if (!t || t.length > 12) continue;
+      var v = wheelNum(t, kind);
+      if (v === null) continue;
+      var r = n.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      var vw = doc.defaultView.innerWidth, vh = doc.defaultView.innerHeight;
+      if (cx < 0 || cy < 0 || cx > vw || cy > vh) continue;
+      var top = doc.elementFromPoint(cx, cy);
+      if (!top || !(n.contains(top) || top.contains(n))) continue;   // clipped away by the wheel window
+      out.push({ el: n, n: v, cy: cy, cx: cx, h: r.height });
+    }
+    out.sort(function (a, b) { return a.cy - b.cy; });
+    return out;
+  }
+  function isWheelColumn(el, p) {
+    var tag = lower(el.tagName);
+    if (tag === "input" || tag === "select" || tag === "textarea" || tag === "button") return false;
+    var dp = datePart(p);
+    if (!dp) return false;
+    var it = wheelItems(el, dp.kind);
+    if (it.length < 3) return false;
+    var xs = it.map(function (i) { return i.cx; });
+    return Math.max.apply(null, xs) - Math.min.apply(null, xs) < 60;   // stacked vertically
+  }
+  // the item the page itself marks as chosen: aria-selected / a "selected" class, or the one row styled unlike all others
+  function wheelSelected(items, col) {
+    var marked = items.filter(function (i) {
+      var e = i.el;
+      for (var k = 0; k < 3 && e && e !== col.parentElement; k++, e = e.parentElement) {
+        var cn = e.className && e.className.baseVal !== undefined ? e.className.baseVal : String(e.className || "");
+        if ((e.getAttribute && e.getAttribute("aria-selected") === "true") || /(^|[\s_-])(sel|selected|active|current|checked|picked|chosen)([\s_-]|$)/i.test(cn)) return true;
+      }
+      return false;
+    });
+    if (marked.length === 1) return marked[0];
+    if (items.length < 4) return null;
+    var sig = items.map(function (i) { var cs = i.el.ownerDocument.defaultView.getComputedStyle(i.el); return cs.color + "|" + cs.fontSize + "|" + cs.fontWeight; });
+    var cnt = {}; sig.forEach(function (x) { cnt[x] = (cnt[x] || 0) + 1; });
+    var odd = items.filter(function (i, k) { return cnt[sig[k]] === 1; });
+    return odd.length === 1 ? odd[0] : null;
+  }
+  function wheelState(col, kind) {
+    var items = wheelItems(col, kind);
+    if (!items.length) return { items: items };
+    var center = wheelSelected(items, col);
+    if (!center) {
+      // nearest to the middle of the visible window (edge rows can be empty, so the items' own middle is not reliable)
+      var cr = col.getBoundingClientRect(), vh = col.ownerDocument.defaultView.innerHeight;
+      var mid = (Math.max(cr.top, 0) + Math.min(cr.bottom, vh)) / 2;
+      if (!(cr.height > 0) || Math.min(cr.bottom, vh) - Math.max(cr.top, 0) < 20) mid = (items[0].cy + items[items.length - 1].cy) / 2;
+      center = items[0];
+      items.forEach(function (i) { if (Math.abs(i.cy - mid) < Math.abs(center.cy - mid)) center = i; });
+    }
+    var first = items[0].n, last = items[items.length - 1].n;
+    return { items: items, center: center, sign: last > first ? 1 : last < first ? -1 : 0 };
+  }
+  async function chooseWheel(col, p) {
+    var dp = datePart(p);
+    if (!g.__ddgWheel || g.__ddgWheel.col !== col) g.__ddgWheel = { col: col, lastCenter: null, stuck: 0, synthDead: false, flip: false, swipes: 0, lastDist: null };
+    var W = g.__ddgWheel;
+    for (var it = 0; it < 80; it++) {
+      var s = wheelState(col, dp.kind);
+      if (!s.items.length) return { ok: false, err: "the wheel shows no readable items" };
+      var cn = s.center.n, need = dp.n - cn;
+      if (need === 0) { g.__ddgWheel = null; return { ok: true, via: "wheel" }; }
+      // progress check (also across the engine's real taps / swipes)
+      if (W.lastCenter === cn) W.stuck++; else W.stuck = 0;
+      if (W.lastDist !== null && Math.abs(need) > W.lastDist) W.flip = !W.flip;   // moved the wrong way: reverse
+      W.lastDist = Math.abs(need);
+      W.lastCenter = cn;
+      if (W.stuck >= 4) { g.__ddgWheel = null; return { ok: false, err: "the " + dp.kind + " wheel would not move to " + p.wanted + " (stuck on " + cn + ")" }; }
+      var tgt = null;
+      s.items.forEach(function (i) { if (i.n === dp.n) tgt = i; });
+      var pick = tgt;
+      var down = (need * (s.sign || 1) > 0) !== W.flip;
+      if (!pick) pick = down ? s.items[s.items.length - 1] : s.items[0];
+      if (pick === s.center) { g.__ddgWheel = null; return { ok: false, err: "the wheel shows only one item, cannot move it" }; }
+      if (!W.synthDead) {
+        synthClick(pick.el);
+        await sleep(420);
+        var s2 = wheelState(col, dp.kind);
+        if (s2.items.length && s2.center.n !== cn) continue;
+        W.synthDead = true;   // the wheel ignores dispatched clicks
+      }
+      // real finger: first taps, and when taps do nothing, drags
+      var nat = nativeInfo(pick.el);
+      if (W.stuck >= 2 || W.swipes) {
+        W.swipes++;
+        var far = down ? s.items[0] : s.items[s.items.length - 1];
+        var to = tgt ? s.center : far;
+        return { ok: false, stage: "wheel", err: "wheel needs a drag", swipe: { x: nat.x, y: nat.y, y2: to.cy, dpr: nat.dpr, vx: nat.vx, vy: nat.vy, vs: nat.vs } };
+      }
+      return { ok: false, stage: "wheel", err: "wheel needs a real tap", native: nat };
+    }
+    g.__ddgWheel = null;
+    return { ok: false, err: "the wheel never reached " + p.wanted };
+  }
+
   // ------------------------------------------------------------------ fill
   async function fill(p) {
     var started = Date.now(), el = null;
@@ -561,6 +706,7 @@
         var wantTick = !/^(false|0|no|off|untick|uncheck)$/i.test(wanted.trim());
         return J(await setChecked(el, wantTick, p));
       }
+      if (datePart(p) && !el.isContentEditable && isWheelColumn(el, p)) return J(await chooseWheel(el, p));
       var isNative = tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable;
       var isCustom = !isNative || el.matches(CUSTOM_SEL);
       if (isCustom) return J(await chooseCustom(el, p));
