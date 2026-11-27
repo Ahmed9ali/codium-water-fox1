@@ -381,8 +381,9 @@
     if (dpart === "day") return "dobDay";
     if (dpart === "year") return "dobYear";
     const hasPhoneSibling = !!(el.parentElement && el.parentElement.querySelector("input[type='tel'],input[autocomplete^='tel'],input[name*='phone' i]"));
-    if (role === "combobox" && /^\+\d{1,4}$/.test(ownText) && (/\b(phone|mobile|tel)\b/.test(context + " " + own) || hasPhoneSibling)) return "countryCode";
-    if (/^\+\d{1,4}$/.test(ownText) && nearPhoneInput(el)) return "countryCode";
+    const isTextInput = tag === "input" || tag === "textarea";
+    if (!isTextInput && role === "combobox" && /^\+\d{1,4}$/.test(ownText) && (/\b(phone|mobile|tel)\b/.test(context + " " + own) || hasPhoneSibling)) return "countryCode";
+    if (!isTextInput && /^\+\d{1,4}$/.test(ownText) && nearPhoneInput(el)) return "countryCode";
 
     if (ac) {
       if (ac.includes("email")) return "email";
@@ -401,6 +402,7 @@
     if (type === "tel") return "phone";
     if (type === "password") return "password";
     if (type === "date") return "dob";
+    if (/\b(user\s*name|username|user\s*id|userid|login\s*name|screen\s*name)\b/.test(own) && !/\b(e-?mail|password|phone)\b/.test(own)) return "username";
     if (freshContext === "countryCode" ||
         /\b(country\s*(calling\s*)?code|calling\s*code|dial(?:ling)?\s*code|phone\s*code|international\s*prefix)\b/.test(c) ||
         /\b(iti__selected-flag|countrycode|country-code|dialcode|dial-code)\b/.test(own)) return "countryCode";
@@ -426,6 +428,8 @@
     }
     if (type === "checkbox" || type === "radio" || role === "checkbox" || role === "radio" || role === "switch") {
       if (/\b(gender|sex|male|female)\b/.test(c)) return "gender";
+      // v29: a radio card / segmented tab ("For myself", "Email", "Phone number") is a tap, not a terms box
+      if (type === "radio" || role === "radio" || role === "tab") return "clickonly";
       return "termscheckbox";
     }
     if (/\b(e-?mail)\b/.test(c)) return "email";
@@ -752,7 +756,7 @@
     const out = [];
     let all;
     try { all = root.querySelectorAll("*"); } catch (_) { return out; }
-    if (all.length > 400) return out;
+    if (all.length > 2500) return out;
     for (let i = 0; i < all.length; i++) {
       const n = all[i];
       let kidText = false;
@@ -774,59 +778,64 @@
   function columnShape(leaves) {
     const ts = leaves.map(function (l) { return l.t; });
     if (ts.some(function (t) { return MONTH_RX.test(t) && /^[A-Za-z]/.test(t); })) return "month";
-    const nums = ts.map(Number);
-    if (nums.some(function (n) { return n >= 1000; })) return "year";
-    if (nums.every(function (n) { return n < 100; }) && nums.length >= 3 && nums.some(function (n) { return n >= 13; })) return nums.some(function (n) { return n >= 32; }) ? "year2" : "day";
+    const nums = ts.map(Number).filter(function (n) { return !isNaN(n); });
+    if (!nums.length) return "";
+    const mx = Math.max.apply(null, nums), n = nums.length;
+    if (mx >= 1000) return "year";
+    if (mx >= 32) return "year";                 // two-digit years (00..99)
+    if (mx >= 13) return n >= 13 ? "day" : "";   // 1..31 (or 1..28/30)
     return "";   // 1..12: month or day, decided by the neighbouring columns
   }
-  function wheelDetect(path) {
-    let item = null;
-    for (let i = 0; i < Math.min(3, path.length); i++) {
-      const el = path[i];
-      if (!el || el.nodeType !== 1) continue;
-      const t = (el.textContent || "").replace(/\s+/g, " ").trim();
-      if (!t) continue;
-      if (dateToken(t)) item = el;
-      break;
-    }
-    let col = null, leaves = null;
-    if (item) {
-      let cur = item.parentElement;
-      for (let d = 0; cur && d < 5 && cur !== document.body; d++, cur = cur.parentElement) {
-        const lv = dateLeaves(cur);
-        if (lv.length >= 3) { col = cur; leaves = lv; break; }
-        if (lv.length === 0 && d > 0) break;
+  // v29: every element under the finger, so a mask / overlay laid over the wheel does not hide the items under it
+  function stackAt(e) {
+    const out = [];
+    try {
+      const pt = (e && e.changedTouches && e.changedTouches[0]) || e;
+      if (pt && typeof pt.clientX === "number") {
+        const els = document.elementsFromPoint(pt.clientX, pt.clientY) || [];
+        for (let i = 0; i < els.length && out.length < 10; i++) out.push(els[i]);
       }
-    } else {
-      // pointer capture / scroll handlers often retarget the tap to the column itself ("2005 2004 2003 2002 2001")
-      for (let i = 0; i < Math.min(3, path.length); i++) {
-        const el = path[i];
-        if (!el || el.nodeType !== 1) continue;
-        const t = (el.innerText || "").replace(/\s+/g, " ").trim();
-        if (!t) continue;
-        const toks = t.split(" ");
-        if (toks.length >= 3 && toks.length <= 12 && toks.every(dateToken)) {
-          const lv = dateLeaves(el);
-          if (lv.length >= 3) { col = el; leaves = lv; item = el; }
+    } catch (_) {}
+    return out;
+  }
+  function wheelDetect(path, e) {
+    const cands = path.slice(0, 3).concat(stackAt(e));
+    let item = null, col = null, leaves = null;
+    for (let ci = 0; ci < cands.length && !col; ci++) {
+      const el = cands[ci];
+      if (!el || el.nodeType !== 1 || el === document.body || el === document.documentElement) continue;
+      if (el.hasAttribute && el.hasAttribute("data-automation-hud")) continue;
+      const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+      if (t && dateToken(t)) {
+        // a single number / month name: climb to the column that holds many of them
+        let cur = el.parentElement;
+        for (let d = 0; cur && d < 6 && cur !== document.body; d++, cur = cur.parentElement) {
+          const lv = dateLeaves(cur);
+          if (lv.length >= 3 && stacked(lv)) { col = cur; leaves = lv; item = el; break; }
+          if (lv.length >= 3) break;
         }
-        break;
+      } else if (t) {
+        // the tap was retargeted to the column itself ("2005 2004 2003 ...") or to a list inside it
+        const toks = (el.innerText || t).replace(/\s+/g, " ").trim().split(" ");
+        if (toks.length >= 3 && toks.length <= 400 && toks.every(dateToken)) {
+          const lv = dateLeaves(el);
+          if (lv.length >= 3 && stacked(lv)) { col = el; leaves = lv; item = el; }
+        }
       }
     }
     if (!col) return null;
-    if (!col || leaves.length > 12 || !stacked(leaves)) return null;   // a calendar grid has 28+ numbers / rows are horizontal
-    // the picker must be about a date of birth
+    // the picker must be about a date of birth: text around the column (digits of the column itself do not count)
     let ctx = "", n = col;
     for (let d = 0; n && d < 8 && n !== document.body; d++, n = n.parentElement) {
       const t = (n.innerText || "").replace(/\s+/g, " ");
-      if (t.length > 1500) break;
+      if (t.length > 6000) break;
       ctx = t;
     }
-    const sibling = [];
     // columns next to this one: leaf groups of the nearest ancestor that holds 2+ columns
     let grp = col.parentElement, groupLeaves = null;
-    for (let d = 0; grp && d < 4 && grp !== document.body; d++, grp = grp.parentElement) {
+    for (let d = 0; grp && d < 5 && grp !== document.body; d++, grp = grp.parentElement) {
       const lv = dateLeaves(grp);
-      if (lv.length > 40) break;
+      if (!lv.length) continue;
       const xs = []; lv.forEach(function (l) { if (!xs.some(function (x) { return Math.abs(x - l.cx) < 40; })) xs.push(l.cx); });
       if (xs.length >= 2) { groupLeaves = lv; break; }
     }
@@ -837,12 +846,12 @@
       c.leaves.push(l);
     });
     cols.sort(function (a, b) { return a.cx - b.cx; });
-    cols.forEach(function (c) { c.shape = columnShape(c.leaves); if (c.shape === "year2") c.shape = "year"; });
+    cols.forEach(function (c) { c.shape = columnShape(c.leaves); });
     const mine = cols.filter(function (c) { return c.leaves.some(function (l) { return l.el === item || l.el.contains(item) || item.contains(l.el) || col.contains(l.el); }); })[0] || cols[0];
     const hasBirth = /\b(birth|dob|born|date of birth|birthday)\b/i.test(ctx) || (lastFieldContextAt && Date.now() - lastFieldContextAt < 60000 && /dob|birth/.test(lastFieldContext));
     const hasYearCol = cols.some(function (c) { return c.shape === "year"; });
     if (!hasBirth && !(hasYearCol && cols.length >= 2)) return null;
-    // ambiguous 1..12 columns: day when the others already say month, otherwise left-to-right day, month, year
+    // ambiguous 1..12 columns: month when day is already taken, otherwise left-to-right day, month, year
     const taken = cols.map(function (c) { return c.shape; }).filter(Boolean);
     const order = ["day", "month", "year"];
     cols.forEach(function (c) {
@@ -952,6 +961,19 @@
     }
     if (!actual) return null;
 
+    // v29: a caption / overlay / wrapper over a text box (floating labels): the step belongs to the one input inside
+    try {
+      if (!/^(INPUT|TEXTAREA|SELECT|BUTTON|A|LABEL)$/.test(actual.tagName) && !actual.isContentEditable) {
+        let w = actual;
+        for (let d = 0; w && d < 3 && w !== document.body; d++, w = w.parentElement) {
+          const ins = w.querySelectorAll("input:not([type='hidden']):not([type='checkbox']):not([type='radio']):not([type='submit']):not([type='button']),textarea");
+          const vis = Array.prototype.filter.call(ins, function (x) { const r = x.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+          if (vis.length === 1 && w.querySelectorAll("button,a,select,[role='button']").length === 0) { actual = vis[0]; break; }
+          if (vis.length > 1) break;
+        }
+      }
+    } catch (_) {}
+
     if (actual.tagName !== "A" && actual.tagName !== "BUTTON") {
       const lab = actual.tagName === "LABEL" ? actual : (actual.closest ? actual.closest("label") : null);
       if (lab) {
@@ -980,9 +1002,36 @@
         if (path[i].hasAttribute && path[i].hasAttribute("data-automation-hud")) { S.ignored++; log("IGNORED (" + src + "): HUD tap"); return; }
       }
 
+      // v29: the tap on the frame element itself (the real tap is recorded inside the frame)
+      if (path[0] && /^(IFRAME|FRAME)$/.test(path[0].tagName || "")) { S.ignored++; log("IGNORED (" + src + "): frame element"); return; }
+
       let wheel = null;
-      try { wheel = wheelDetect(path); } catch (_) {}
-      const actual = wheel ? wheel.col : resolveTarget(path);
+      try { wheel = wheelDetect(path, e); } catch (_) {}
+      let actual = wheel ? wheel.col : resolveTarget(path);
+      // v29: a floating label / wrapper tapped instead of its input (Vinted "Email", "Username"): use the one input inside
+      if (actual && !wheel) {
+        try {
+          const atag = (actual.tagName || "").toLowerCase();
+          const arole = (actual.getAttribute("role") || "").toLowerCase();
+          if (!/^(input|textarea|select|button|a|summary|label)$/.test(atag) && !/^(button|link|tab|radio|checkbox|switch|combobox|option|menuitem)$/.test(arole) &&
+              !actual.isContentEditable && !actual.hasAttribute("aria-haspopup")) {
+            const at = (actual.innerText || actual.textContent || "").replace(/\s+/g, " ").trim();
+            let w = actual;
+            for (let d = 0; w && d < 4 && w !== document.body; d++, w = w.parentElement) {
+              const ins = w.querySelectorAll("input:not([type='hidden']):not([type='checkbox']):not([type='radio']):not([type='submit']):not([type='button']),textarea");
+              if (ins.length === 1) {
+                const wr = w.getBoundingClientRect();
+                if (wr.height <= 160 && at.length <= 40 && (ins[0].contains(actual) || w.contains(actual))) {
+                  const nb = w.querySelectorAll("button,a,[role='button'],select").length;
+                  if (nb <= 1) actual = ins[0];
+                }
+                break;
+              }
+              if (ins.length > 1) break;
+            }
+          }
+        } catch (_) {}
+      }
       if (!actual) { ignore("IGNORED (" + src + "): no interactive target, tapped " + describe(path[0]), path[0]); return; }
       if (!isVisible(actual) && !isBoxy(actual)) { ignore("IGNORED (" + src + "): not visible " + describe(actual), actual); return; }
 
@@ -1020,10 +1069,11 @@
       }
       // v21: "state" added so custom state/province dropdowns are Fields, not ClickNext
       const isSemanticPicker = ["country", "countryCode", "currency", "state"].indexOf(inferredType) !== -1;
-      const isFieldLike =
+      const clickOnly = inferredType === "clickonly";
+      const isFieldLike = !clickOnly && (
         tag === "textarea" || tag === "select" ||
         (tag === "input" && CLICK_INPUT_TYPES.indexOf(type) === -1) ||
-        actual.isContentEditable || semanticField || isDatePart || isSemanticPicker || isChoice;
+        actual.isContentEditable || semanticField || isDatePart || isSemanticPicker || isChoice);
       const kind = isFieldLike ? "Field" : "ClickNext";
 
       try {
@@ -1046,7 +1096,25 @@
         }, 650);
       } catch (_) {}
 
-      const label = wheel ? "date wheel" : getLabel(actual);
+      let label = wheel ? "date wheel" : getLabel(actual);
+      // v29: a step labelled with the page title is a tap on the page / a frame, not on a control
+      try {
+        const pt = (document.title || "").replace(/\s+/g, " ").trim();
+        let topTitle = pt; try { topTitle = (window.top.document.title || pt).replace(/\s+/g, " ").trim(); } catch (_) {}
+        if (!wheel && kind === "ClickNext" && label && (label === pt || label === topTitle || /^(html|body|iframe|frame)$/.test(tag))) {
+          ignore("IGNORED (" + src + "): tap on the page itself", actual); return;
+        }
+      } catch (_) {}
+      if (clickOnly) {
+        // the card's own text ("For myself"), not the generic "Element"
+        let cardText = "";
+        for (let q = actual, d = 0; q && d < 5 && q !== document.body; d++, q = q.parentElement) {
+          const t = (q.innerText || q.textContent || "").replace(/\s+/g, " ").trim();
+          if (t && t.length <= 50) { cardText = t; break; }
+          if (t && t.length > 50) break;
+        }
+        label = cardText || label || "Option";
+      }
       const chosenNow = function (sel) { try { const o = sel.options[sel.selectedIndex]; return o ? (o.text || o.label || o.value || "").replace(/\s+/g, " ").trim().slice(0, 90) : ""; } catch (_) { return ""; } };
       const payload = {
         kind: kind, tag: tag, domType: type,

@@ -149,3 +149,116 @@ private fun LabeledField(
         }
     }
 }
+
+/**
+ * "Generate a new group": asks for the group name (country, phonenumber, dob2...), picks the data type from the name
+ * (changeable), how many values, and creates the group already filled. No need to make a group with 1 value first.
+ *
+ * Use in MyDataScreen, beside the "+" icon of the top bar:
+ *
+ *     var showCreateGen by remember { mutableStateOf(false) }
+ *     // icon button next to "+":   IconButton(onClick = { showCreateGen = true }) { Icon(Icons.Filled.AutoAwesome, "Generate") }
+ *     if (showCreateGen) {
+ *         GenerateGroupDialog(
+ *             recurring = selectedTabIsRecurring,        // true on the Recurring Data tab, false on Default Data
+ *             onDismiss = { showCreateGen = false },
+ *         )
+ *     }
+ */
+@Composable
+fun GenerateGroupDialog(
+    recurring: Boolean,
+    onDismiss: () -> Unit,
+    onCreated: (String, Int) -> Unit = { _, _ -> },
+) {
+    val bg = Color(0xFF2B2B2B)
+    val card = Color(0xFF3A3A3A)
+    val accent = Color(0xFF6D8DF7)
+    val textColor = Color(0xFFEAEAEA)
+    val muted = Color(0xFF9A9A9A)
+
+    var name by remember { mutableStateOf("") }
+    var pickedType by remember { mutableStateOf<String?>(null) }   // null = follow the group name
+    var countText by remember { mutableStateOf("10") }
+    var p1 by remember { mutableStateOf("") }
+    var p2 by remember { mutableStateOf("") }
+    var isRecurring by remember { mutableStateOf(recurring) }
+
+    val type = pickedType ?: DataGenerator.typeForGroup(name)
+    val specs = DataGenerator.paramSpecs(type)
+    val baseOfType = VaultRepository.splitOrdinal(type).first
+    val count = (countText.toIntOrNull() ?: 0).coerceIn(0, 500)
+    val canCreate = name.isNotBlank() && count > 0
+
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(bg, RoundedCornerShape(20.dp))
+                .padding(20.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            BasicText("Generate a new group", style = TextStyle(color = textColor, fontSize = 18.sp, fontWeight = FontWeight.SemiBold))
+            LabeledField("Group name (e.g. country, phonenumber, dob2)", name, { name = it.take(40) }, "country", card, textColor, muted, accent)
+
+            BasicText("Group kind", style = TextStyle(color = muted, fontSize = 12.sp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(true to "Recurring", false to "Default").forEach { (flag, label) ->
+                    val sel = isRecurring == flag
+                    Box(
+                        modifier = Modifier
+                            .background(if (sel) accent else card, RoundedCornerShape(50))
+                            .clickable { isRecurring = flag }
+                            .padding(horizontal = 14.dp, vertical = 8.dp),
+                    ) { BasicText(label, style = TextStyle(color = if (sel) Color.White else textColor, fontSize = 14.sp)) }
+                }
+            }
+
+            BasicText("Type of data (picked from the name, tap to change)", style = TextStyle(color = muted, fontSize = 12.sp))
+            Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                DataGenerator.TYPES.forEach { t ->
+                    val selected = t.key == baseOfType
+                    Box(
+                        modifier = Modifier
+                            .background(if (selected) accent else card, RoundedCornerShape(50))
+                            .clickable {
+                                val ord = VaultRepository.splitOrdinal(type).second
+                                pickedType = if (ord > 1) t.key + ord else t.key
+                                p1 = ""; p2 = ""
+                            }
+                            .padding(horizontal = 14.dp, vertical = 8.dp),
+                    ) { BasicText(t.label, style = TextStyle(color = if (selected) Color.White else textColor, fontSize = 14.sp)) }
+                }
+            }
+
+            LabeledField("How many", countText, { countText = it.filter(Char::isDigit).take(3) }, "10", card, textColor, muted, accent, numeric = true)
+            specs.getOrNull(0)?.let { sp -> LabeledField(sp.label, p1, { p1 = it }, sp.default, card, textColor, muted, accent) }
+            specs.getOrNull(1)?.let { sp -> LabeledField(sp.label, p2, { p2 = it }, sp.default, card, textColor, muted, accent) }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Box(
+                    modifier = Modifier.weight(1f).border(1.dp, accent, RoundedCornerShape(14.dp)).clickable { onDismiss() }.padding(vertical = 12.dp),
+                    contentAlignment = Alignment.Center,
+                ) { BasicText("Cancel", style = TextStyle(color = accent, fontSize = 16.sp)) }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .background(if (canCreate) accent else card, RoundedCornerShape(14.dp))
+                        .clickable(enabled = canCreate) {
+                            val trimmed = name.trim()
+                            val values = DataGenerator.generate(type, count, p1, p2)
+                            // create the (empty) group, or reuse the one with this name, then fill it
+                            VaultRepository.addGroup(trimmed, "", if (isRecurring) DataGroupType.RECURRING else DataGroupType.DEFAULT)
+                            val actual = VaultRepository.groups.value.firstOrNull { it.name.equals(trimmed, ignoreCase = true) }?.name ?: trimmed
+                            VaultRepository.addGeneratedEntries(actual, type, values)
+                            onCreated(actual, values.size)
+                            onDismiss()
+                        }
+                        .padding(vertical = 12.dp),
+                    contentAlignment = Alignment.Center,
+                ) { BasicText("Create & generate", style = TextStyle(color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)) }
+            }
+        }
+    }
+}

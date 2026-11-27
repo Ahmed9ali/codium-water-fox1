@@ -479,18 +479,25 @@
     }
     var found = null, opts = [];
     var stuck = 0, lastCount = -1;
+    g.__ddgNeedSwipe = null;
     for (var i = 0; i < 160 && !found; i++) {
       opts = scan();
       found = pickOption(opts, p);
       if (found) break;
       var sc = listScroller(opts, trigger);
-      if (!sc) break;
+      if (!sc) {
+        // no scroll box found: ask the browser to bring the last row into view, then give up to a real drag
+        var lastRow = opts.filter(function (o) { return text(o).length <= 60; }).pop();
+        if (lastRow && i < 3) { try { lastRow.scrollIntoView({ block: "end" }); } catch (_) {} await sleep(250); if (pickOption(scan(), p)) continue; }
+        g.__ddgNeedSwipe = opts;
+        break;
+      }
       var prevTop = sc.scrollTop, prevCount = opts.length;
       // one full window per step: long lists (240 countries) render more rows only while they are scrolled
       sc.scrollTop += Math.max(240, sc.clientHeight * 0.95);
       try { sc.dispatchEvent(new (sc.ownerDocument.defaultView.Event)("scroll", { bubbles: true })); } catch (_) {}
       await sleep(i < 4 ? 160 : 110);
-      if (sc.scrollTop === prevTop) { if (++stuck >= 3) break; await sleep(250); } else stuck = 0;
+      if (sc.scrollTop === prevTop) { if (++stuck >= 3) { g.__ddgNeedSwipe = opts; break; } await sleep(250); } else stuck = 0;
       lastCount = prevCount;
     }
     if (found) return found;
@@ -510,6 +517,28 @@
       for (var k = 0; k < 6 && !found; k++) { await sleep(300); found = pickOption(scan(), p); }
     }
     return found;
+  }
+
+  // a long list that will not scroll from script: describe a real upward drag over its rows for the engine
+  function listSwipe(opts, p) {
+    var rows = (opts || []).filter(function (o) {
+      var t = text(o); if (!t || t.length > 60) return false;
+      var r = o.getBoundingClientRect(); return r.height > 8 && r.height < 120 && r.top >= 0 && r.bottom <= (window.innerHeight || 9999);
+    });
+    if (rows.length < 3) return null;
+    // the column of rows that has the most members
+    var cols = {};
+    rows.forEach(function (o) { var r = o.getBoundingClientRect(), k = Math.round((r.left + r.width / 2) / 60); (cols[k] = cols[k] || []).push(o); });
+    var best = null; Object.keys(cols).forEach(function (k) { if (!best || cols[k].length > best.length) best = cols[k]; });
+    var ys = best.map(function (o) { var r = o.getBoundingClientRect(); return r.top + r.height / 2; }).sort(function (a, b) { return a - b; });
+    var first = best.filter(function (o) { var r = o.getBoundingClientRect(); return r.top + r.height / 2 === ys[0]; })[0];
+    var rr = first.getBoundingClientRect();
+    var sig = text(best[0]) + "|" + text(best[best.length - 1]);
+    var W = g.__ddgScrollSwipe = g.__ddgScrollSwipe && g.__ddgScrollSwipe.want === p.wanted ? g.__ddgScrollSwipe : { want: p.wanted, n: 0, sig: "", same: 0 };
+    W.n++; if (W.sig === sig) W.same++; else W.same = 0; W.sig = sig;
+    if (W.n > 40 || W.same >= 3) { g.__ddgScrollSwipe = null; return null; }
+    var vv = window.visualViewport;
+    return { x: rr.left + rr.width / 2, y: ys[ys.length - 1], y2: Math.max(ys[0] - 4, 4), dpr: window.devicePixelRatio || 1, vx: vv ? vv.offsetLeft : 0, vy: vv ? vv.offsetTop : 0, vs: vv ? vv.scale : 1 };
   }
 
   async function clickOption(found, trigger, p) {
@@ -535,7 +564,11 @@
     var wanted = String(p.wanted || "");
     if (!wanted) return J({ ok: false, err: "no data value available for this field: " + p.fieldType });
     var found = await findInOpenList(p, null);
-    if (!found) return J({ ok: false, err: "no matching option found: " + wanted });
+    if (!found) {
+      var sw0 = g.__ddgNeedSwipe && listSwipe(g.__ddgNeedSwipe, p);
+      if (sw0) return J({ ok: false, stage: "scroll", swipe: sw0, err: "the list needs a drag" });
+      return J({ ok: false, err: "no matching option found: " + wanted });
+    }
     return J(await clickOption(found, null, p));
   }
 
@@ -554,6 +587,8 @@
     }
     var found = await findInOpenList(p, trigger);
     if (!found) {
+      var sw1 = g.__ddgNeedSwipe && p.skipOpen && listSwipe(g.__ddgNeedSwipe, p);
+      if (sw1) return { ok: false, stage: "scroll", swipe: sw1, err: "the list needs a drag" };
       if (!p.skipOpen) {
         // The page may ignore synthetic clicks on the trigger (list never opened): ask the engine for a real tap on it.
         try { trigger.scrollIntoView({ block: "center", inline: "nearest" }); await sleep(150); } catch (_) {}
@@ -586,6 +621,18 @@
     if (kind === "y" && n < 100) n += n > 30 ? 1900 : 2000;
     return n;
   }
+  // true when the point lies outside an ancestor that clips its content (overflow hidden / scroll / auto)
+  function clippedAway(n, cx, cy) {
+    var win = n.ownerDocument.defaultView, e = n.parentElement;
+    for (var k = 0; e && k < 8 && e !== n.ownerDocument.body; k++, e = e.parentElement) {
+      var cs = win.getComputedStyle(e);
+      if (/(hidden|scroll|auto|clip)/.test(cs.overflow + cs.overflowY)) {
+        var r = e.getBoundingClientRect();
+        if (r.height > 0 && (cy < r.top - 1 || cy > r.bottom + 1 || cx < r.left - 1 || cx > r.right + 1)) return true;
+      }
+    }
+    return false;
+  }
   function wheelItems(col, kind) {
     var out = [], all;
     try { all = Array.prototype.slice.call(col.querySelectorAll("*")); } catch (_) { return out; }
@@ -603,8 +650,7 @@
       var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
       var vw = doc.defaultView.innerWidth, vh = doc.defaultView.innerHeight;
       if (cx < 0 || cy < 0 || cx > vw || cy > vh) continue;
-      var top = doc.elementFromPoint(cx, cy);
-      if (!top || !(n.contains(top) || top.contains(n))) continue;   // clipped away by the wheel window
+      if (clippedAway(n, cx, cy)) continue;   // outside the wheel window (a mask on top of it does not matter)
       out.push({ el: n, n: v, cy: cy, cx: cx, h: r.height });
     }
     out.sort(function (a, b) { return a.cy - b.cy; });
@@ -828,13 +874,45 @@
       if (el.tagName === "A" && el.target === "_blank") el.target = "_self";
       window.__ddgNavMark = true;
       try { el.focus(); } catch (_) {}
+      // v29: watch the page for a reaction, so the engine can tap for real when the page ignored the dispatched click
+      var chk = { el: el, href: location.href, muts: 0, mo: null, root: null };
+      try {
+        chk.root = el.closest("[role=dialog],[aria-modal=true],dialog,form,[class*=modal i],[class*=dialog i],[class*=popup i],main,section") || null;
+        if (chk.root === document.body || chk.root === document.documentElement) chk.root = null;
+      } catch (_) {}
+      try {
+        chk.mo = new MutationObserver(function (list) {
+          for (var i = 0; i < list.length; i++) {
+            var t = list[i].target;
+            if (t && t.nodeType === 1 && t.closest && t.closest("[data-automation-hud]")) continue;
+            // only changes around the clicked control count (a modal / form / its section), not ads and animations elsewhere
+            if (chk.root && t && !(chk.root.contains(t) || (t.contains && t.contains(chk.root)))) continue;
+            chk.muts++;
+          }
+        });
+        chk.mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+      } catch (_) {}
+      g.__ddgClickCheck = chk;
       synthClick(el);
       return J({ ok: true, via: hit.via });
     } catch (e) { return J({ ok: false, err: "click error: " + e.message }); }
   }
 
+  // After a ClickNext: did the page react? Answers ok:true when it did (or the page was replaced); otherwise a real tap position.
+  async function clickcheck() {
+    var c = g.__ddgClickCheck;
+    g.__ddgClickCheck = null;
+    if (!c) return J({ ok: true, via: "page replaced" });
+    await sleep(250);
+    try { if (c.mo) c.mo.disconnect(); } catch (_) {}
+    var el = c.el;
+    if (c.muts > 0 || location.href !== c.href || !el || !el.isConnected || !visible(el)) return J({ ok: true, via: "page reacted" });
+    return J({ ok: false, stage: "tap", native: nativeInfo(el), err: "the page ignored the click" });
+  }
+
   // ------------------------------------------------------------------ frames
   async function local(kind, params) {
+    if (kind === "clickcheck") return await clickcheck();
     if (kind === "fill") return await fill(params);
     if (kind === "click") return await click(params);
     if (kind === "verify") return await verify();

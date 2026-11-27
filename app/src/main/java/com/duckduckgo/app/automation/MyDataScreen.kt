@@ -36,6 +36,7 @@ fun MyDataScreen(
     var groupToRename by remember { mutableStateOf<String?>(null) }
     var renameInput by remember { mutableStateOf("") }
     var overflowMenuFor by remember { mutableStateOf<String?>(null) }
+    var showCreateGen by remember { mutableStateOf(false) }
 
     val currentType = if (selectedTab == 0) DataGroupType.RECURRING else DataGroupType.DEFAULT
     val groups = if (selectedTab == 0) VaultRepository.getRecurringGroups() else VaultRepository.getDefaultGroups()
@@ -68,6 +69,9 @@ fun MyDataScreen(
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.weight(1f),
             )
+            IconButton(onClick = { showCreateGen = true }) {
+                Text("✨", fontSize = 20.sp)
+            }
             IconButton(onClick = { onAddClick(currentType) }) {
                 Icon(
                     painter = painterResource(drawable.ic_add_24),
@@ -183,6 +187,14 @@ fun MyDataScreen(
                 }
             }
         }
+    }
+
+    if (showCreateGen) {
+        GenerateGroupDialog(
+            recurring = selectedTab == 0,
+            onDismiss = { showCreateGen = false },
+            onCreated = { name, n -> Toast.makeText(context, "Created '$name' with $n values", Toast.LENGTH_SHORT).show() },
+        )
     }
 
     // Delete Confirmation

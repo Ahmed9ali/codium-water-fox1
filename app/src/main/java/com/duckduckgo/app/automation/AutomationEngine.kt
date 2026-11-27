@@ -730,9 +730,23 @@ object AutomationEngine {
             res = execStep(webView, "fill", fillParams(step, value, humanize), host)
         }
 
+        // 1c) A long list (country codes) that will not scroll from script: real drags up the list, one page at a time
+        var scrollRounds = 0
+        while (!res.optBoolean("ok", false) && res.optString("stage") == "scroll" && scrollRounds < 40) {
+            scrollRounds++
+            val sw = res.optJSONObject("swipe") ?: break
+            if (!nativeSwipe(webView, sw)) break
+            delay(500)
+            res = execStep(webView, "fill", fillParams(step, value, humanize, skipOpen = true), host)
+            if (!res.optBoolean("ok", false) && res.optString("stage") != "scroll" && res.optJSONObject("native") == null && host != null) {
+                val top = execStep(webView, "pick", fillParams(step, value, humanize), "")
+                if (top.optBoolean("ok", false) || top.optJSONObject("native") != null || top.optString("stage") == "scroll") { res = top; verifyHost = null }
+            }
+        }
+
         // 2) The page ignored dispatched clicks on the option: tap it for real, then check that the field changed.
         val nativeInfo = res.optJSONObject("native")
-        if (!res.optBoolean("ok", false) && nativeInfo != null && res.optString("stage") != "open" && res.optString("stage") != "wheel") {
+        if (!res.optBoolean("ok", false) && nativeInfo != null && res.optString("stage") != "open" && res.optString("stage") != "wheel" && res.optString("stage") != "scroll") {
             if (nativeTap(webView, nativeInfo)) {
                 delay(500)
                 val verdict = execStep(webView, "verify", JSONObject(), verifyHost)
@@ -901,6 +915,21 @@ object AutomationEngine {
                                 markDoc(webView)
                                 ensureExecutor(webView)
                                 segmentStart = stepIdx + 1
+                            } else {
+                                // the page did not change: did it ignore the dispatched click? then tap for real
+                                val chk = execStep(webView, "clickcheck", JSONObject(), frameHostOf(step))
+                                val nat = chk.optJSONObject("native")
+                                if (!chk.optBoolean("ok", false) && nat != null) {
+                                    Log.d(TAG, "ClickNext '${step.displayLabel}': page ignored the click, tapping for real")
+                                    if (nativeTap(webView, nat)) {
+                                        delay(400)
+                                        if (waitAfterClick(webView)) {
+                                            markDoc(webView)
+                                            ensureExecutor(webView)
+                                            segmentStart = stepIdx + 1
+                                        }
+                                    }
+                                }
                             }
                         } else {
                             lastError = res.optString("err").ifBlank { "no result from page (timeout)" }

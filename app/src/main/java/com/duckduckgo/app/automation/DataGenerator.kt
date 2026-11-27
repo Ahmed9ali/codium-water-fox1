@@ -56,11 +56,42 @@ object DataGenerator {
         else -> emptyList()
     }
 
-    /** Type to start from for a group name: "Dob2" -> "dob2", "Company Website" -> "website", unknown -> "text". */
+    private val ALIASES: Map<String, String> = mapOf(
+        "phonenumber" to "phone", "phonenumbers" to "phone", "phones" to "phone", "mobile" to "phone", "mobilenumber" to "phone", "tel" to "phone",
+        "emails" to "email", "emailaddress" to "email", "mail" to "email",
+        "passwords" to "password", "pass" to "password",
+        "name" to "fullname", "names" to "fullname", "fullnames" to "fullname",
+        "first" to "firstname", "firstnames" to "firstname", "last" to "lastname", "lastnames" to "lastname", "surname" to "lastname",
+        "usernames" to "username", "user" to "username", "login" to "username",
+        "countries" to "country", "nation" to "country",
+        "countrycodes" to "countrycode", "dialcode" to "countrycode", "callingcode" to "countrycode", "phonecode" to "countrycode",
+        "dateofbirth" to "dob", "birthday" to "dob", "birthdate" to "dob", "bday" to "dob",
+        "birthyear" to "dobyear", "birthmonth" to "dobmonth",
+        "companies" to "company", "organization" to "company", "organisation" to "company", "business" to "company",
+        "websites" to "website", "url" to "website", "site" to "website",
+        "job" to "jobtitle", "jobs" to "jobtitle", "title" to "jobtitle",
+        "addresses" to "address", "street" to "address", "cities" to "city",
+        "zipcode" to "zip", "postalcode" to "zip", "postcode" to "zip", "pincode" to "zip",
+        "code" to "otp", "pin" to "otp", "otpcode" to "otp",
+    )
+
+    /** Type to start from for a group name: "Dob2" -> "dob2", "Phone Number" -> "phone", "Company Website" -> "website", unknown -> "text". */
     fun typeForGroup(groupName: String): String {
         val slot = VaultRepository.slotKey(groupName)
         val base = VaultRepository.splitOrdinal(groupName).first
-        return if (TYPES.any { it.key == base }) slot else "text"
+        if (TYPES.any { it.key == base }) return slot
+        val ord = VaultRepository.splitOrdinal(groupName).second
+        val flat = groupName.lowercase().filter { it.isLetterOrDigit() }.trimEnd { it.isDigit() }
+        val alias = ALIASES[flat] ?: ALIASES[base]
+        if (alias != null) return if (ord > 1) alias + ord else alias
+        // "Company Website", "My phone numbers": the last known word wins
+        val words = groupName.lowercase().split(Regex("[^a-z0-9]+")).filter { it.isNotEmpty() }.reversed()
+        for (w in words) {
+            val k = w.trimEnd { it.isDigit() }
+            val hit = if (TYPES.any { it.key == k }) k else ALIASES[k]
+            if (hit != null) return hit
+        }
+        return "text"
     }
 
     private fun baseOf(type: String): String = VaultRepository.splitOrdinal(type).first
