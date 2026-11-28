@@ -864,6 +864,18 @@
     return { col: col, type: shape === "year" ? "dobYear" : shape === "month" ? "dobMonth" : "dobDay" };
   }
 
+  // the outermost small control whose whole text is a dial code ("+91"), standing next to a phone box
+  function dialTriggerOf(start) {
+    let best = null, q = start;
+    for (let d = 0; q && d < 5 && q !== document.body; d++, q = q.parentElement) {
+      const t = (q.innerText || q.textContent || "").replace(/\s+/g, " ").trim();
+      if (/^\+\d{1,4}$/.test(t)) {
+        const r = q.getBoundingClientRect();
+        if (r.width <= 260 && r.height <= 120 && !q.querySelector("input,textarea") && nearPhoneInput(q)) best = q;
+      } else if (t.length > 0) break;
+    }
+    return best;
+  }
   function resolveTarget(path) {
     let actual = null;
     for (let i = 0; i < path.length; i++) {
@@ -961,6 +973,14 @@
     }
     if (!actual) return null;
 
+    // v30: the flag / "+91" / chevron of a dial-code picker is one control (never the phone box next to it)
+    try {
+      if (!/^(INPUT|TEXTAREA|SELECT)$/.test(actual.tagName)) {
+        const dt = dialTriggerOf(actual);
+        if (dt) return dt;
+      }
+    } catch (_) {}
+
     // v29: a caption / overlay / wrapper over a text box (floating labels): the step belongs to the one input inside
     try {
       if (!/^(INPUT|TEXTAREA|SELECT|BUTTON|A|LABEL)$/.test(actual.tagName) && !actual.isContentEditable) {
@@ -991,6 +1011,7 @@
     toast(msg.replace(/^IGNORED \(/, "Skipped ("), "#6B7280", target);
   }
 
+  const lastTap = { t: 0, x: -1, y: -1 };
   function processEvent(e, src) {
     try {
       if (!S.active) return;
@@ -1002,14 +1023,44 @@
         if (path[i].hasAttribute && path[i].hasAttribute("data-automation-hud")) { S.ignored++; log("IGNORED (" + src + "): HUD tap"); return; }
       }
 
+      // v30: a focus that the page moved by itself (tapping the "+91" picker focuses the phone box) is not a tap on that box
+      if (src === "focusin") {
+        const ft = e.target;
+        let inside = false;
+        if (ft && ft.getBoundingClientRect && Date.now() - lastTap.t < 2000) {
+          const r = ft.getBoundingClientRect();
+          inside = lastTap.x >= r.left - 8 && lastTap.x <= r.right + 8 && lastTap.y >= r.top - 8 && lastTap.y <= r.bottom + 8;
+        }
+        if (!inside) { S.ignored++; log("IGNORED (focusin): focus not caused by a tap on it"); return; }
+      }
+
       // v29: the tap on the frame element itself (the real tap is recorded inside the frame)
       if (path[0] && /^(IFRAME|FRAME)$/.test(path[0].tagName || "")) { S.ignored++; log("IGNORED (" + src + "): frame element"); return; }
 
       let wheel = null;
       try { wheel = wheelDetect(path, e); } catch (_) {}
       let actual = wheel ? wheel.col : resolveTarget(path);
-      // v29: a floating label / wrapper tapped instead of its input (Vinted "Email", "Username"): use the one input inside
+      let dialTrigger = false;
+      // v30: the flag, the "+91" text or the chevron of a dial-code picker: the picker is the whole "+91 v" control
       if (actual && !wheel) {
+        try {
+          const atag0 = (actual.tagName || "").toLowerCase();
+          if (atag0 !== "input" && atag0 !== "textarea") {
+            let best = null, q = actual;
+            for (let d = 0; q && d < 5 && q !== document.body; d++, q = q.parentElement) {
+              const t = (q.innerText || q.textContent || "").replace(/\s+/g, " ").trim();
+              if (/^\+\d{1,4}$/.test(t)) {
+                const r = q.getBoundingClientRect();
+                if (r.width <= 260 && r.height <= 120 && !q.querySelector("input,textarea") && nearPhoneInput(q)) best = q;
+              } else if (t.length > 0) break;
+            }
+            if (best) { actual = best; dialTrigger = true; }
+          }
+        } catch (_) {}
+      }
+
+      // v29: a floating label / wrapper tapped instead of its input (Vinted "Email", "Username"): use the one input inside
+      if (actual && !wheel && !dialTrigger) {
         try {
           const atag = (actual.tagName || "").toLowerCase();
           const arole = (actual.getAttribute("role") || "").toLowerCase();
@@ -1145,6 +1196,9 @@
         buttonLabel: kind === "ClickNext" ? (shortCaption(label, path[0]) || "Button") : "",
         verified: true,
       };
+      // v30: tap + the focus it causes (or a second event for the same tap) are one step
+      if (!wheel && S.lastCap && S.lastCap.el === actual && Date.now() - S.lastCap.t < 1500) { S.ignored++; log("IGNORED (" + src + "): same control just recorded"); return; }
+      S.lastCap = { el: actual, t: Date.now() };
       S.captured++;
       log("CAPTURED (" + src + "):", tag, payload.displayLabel);
       payload.seq = ++S.seq;
@@ -1253,6 +1307,7 @@
     }), passiveCap);
 
     on("pointerdown", track("pointerdown", function (e) {
+      lastTap.t = Date.now(); lastTap.x = e.clientX; lastTap.y = e.clientY;
       if (e.pointerType === "touch") { tX = e.clientX; tY = e.clientY; tT = Date.now(); tMoved = false; }
       suppressKeyboard(e, false);
     }), cap);

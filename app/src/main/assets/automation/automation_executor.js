@@ -81,9 +81,9 @@
   }
 
   // ------------------------------------------------------------------ synthetic click
-  function synthClick(el) {
+  function synthClick(el, noScroll) {
     if (!el) return false;
-    try { el.scrollIntoView({ block: "center", inline: "nearest" }); } catch (_) {}
+    if (!noScroll) { try { el.scrollIntoView({ block: "center", inline: "nearest" }); } catch (_) {} }
     try {
       var w = el.ownerDocument.defaultView, r = el.getBoundingClientRect();
       var base = { bubbles: true, cancelable: true, composed: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0, view: w };
@@ -435,8 +435,8 @@
     return !!live && valueMatches(text(live) || live.value || "", p, true);
   }
 
-  function nativeInfo(found, trigger, kind, label, p) {
-    try { found.scrollIntoView({ block: "center", inline: "nearest" }); } catch (_) {}
+  function nativeInfo(found, trigger, kind, label, p, noScroll) {
+    if (!noScroll) { try { found.scrollIntoView({ block: "center", inline: "nearest" }); } catch (_) {} }
     var rect = found.getBoundingClientRect();
     var vv = window.visualViewport;
     return {
@@ -686,7 +686,7 @@
   function wheelState(col, kind) {
     var items = wheelItems(col, kind);
     if (!items.length) return { items: items };
-    var center = wheelSelected(items, col);
+    var center = wheelSelected(items, col), marked = !!center;
     if (!center) {
       // nearest to the middle of the visible window (edge rows can be empty, so the items' own middle is not reliable)
       var cr = col.getBoundingClientRect(), vh = col.ownerDocument.defaultView.innerHeight;
@@ -696,45 +696,115 @@
       items.forEach(function (i) { if (Math.abs(i.cy - mid) < Math.abs(center.cy - mid)) center = i; });
     }
     var first = items[0].n, last = items[items.length - 1].n;
-    return { items: items, center: center, sign: last > first ? 1 : last < first ? -1 : 0 };
+    return { items: items, center: center, marked: marked, sign: last > first ? 1 : last < first ? -1 : 0 };
+  }
+  // the date the page shows above the wheels ("03/10/2005"): the most reliable read-out of what is selected
+  function headerPart(col, kind) {
+    var e = col.parentElement, rx = /(?:^|[^\d])(\d{1,4})\s*[\/.\-]\s*(\d{1,2})\s*[\/.\-]\s*(\d{1,4})(?:[^\d]|$)/;
+    for (var k = 0; e && k < 7; k++, e = e.parentElement) {
+      var nodes = e.querySelectorAll("*");
+      for (var i = 0; i < nodes.length && i < 600; i++) {
+        var n = nodes[i];
+        if (n.children && n.children.length) continue;
+        var t = (n.textContent || "").replace(/\s+/g, " ").trim();
+        if (t.length < 6 || t.length > 14) continue;
+        var m = rx.exec(t);
+        if (!m) continue;
+        var a = parseInt(m[1], 10), b = parseInt(m[2], 10), c = parseInt(m[3], 10);
+        var y, mo, d;
+        if (m[1].length === 4) { y = a; mo = b; d = c; }
+        else { y = c; if (a > 12) { d = a; mo = b; } else if (b > 12) { mo = a; d = b; } else { d = a; mo = b; } }
+        return kind === "y" ? y : kind === "m" ? mo : d;
+      }
+    }
+    return null;
+  }
+  // wait until the wheel stops moving (snap animation), then read it
+  async function settledState(col, kind, W) {
+    var last = null, same = 0, st = null;
+    for (var i = 0; i < 14; i++) {
+      st = wheelState(col, kind);
+      var hp = headerPart(col, kind);
+      var key = (hp === null ? "-" : hp) + "|" + (st.center ? st.center.n : "-");
+      if (key === last) { if (++same >= 2) break; } else same = 0;
+      last = key;
+      await sleep(220);
+    }
+    st.header = headerPart(col, kind);
+    if (st.items.length >= 3) {
+      var ds = [];
+      for (var j = 1; j < st.items.length; j++) ds.push(st.items[j].cy - st.items[j - 1].cy);
+      ds.sort(function (a, b) { return a - b; });
+      W.rowH = Math.max(8, ds[Math.floor(ds.length / 2)] || 0) || W.rowH;
+      if (st.sign) W.sign = st.sign;
+    }
+    return st;
   }
   async function chooseWheel(col, p) {
     var dp = datePart(p);
-    if (!g.__ddgWheel || g.__ddgWheel.col !== col) g.__ddgWheel = { col: col, lastCenter: null, stuck: 0, synthDead: false, flip: false, swipes: 0, lastDist: null };
+    if (!g.__ddgWheel || g.__ddgWheel.col !== col) g.__ddgWheel = { col: col, lastCenter: null, stuck: 0, synthDead: false, flip: false, swipes: 0, lastDist: null, gain: 1, lastReq: null, lastCur: null, sign: 0, rowH: 0, noMove: 0, rounds: 0, okHits: 0 };
     var W = g.__ddgWheel;
     for (var it = 0; it < 80; it++) {
-      var s = wheelState(col, dp.kind);
-      if (!s.items.length) return { ok: false, err: "the wheel shows no readable items" };
-      var cn = s.center.n, need = dp.n - cn;
-      if (need === 0) { g.__ddgWheel = null; return { ok: true, via: "wheel" }; }
-      // progress check (also across the engine's real taps / swipes)
+      var s = await settledState(col, dp.kind, W);
+      var cr = col.getBoundingClientRect();
+      var vh = col.ownerDocument.defaultView.innerHeight;
+      var top = Math.max(cr.top, 0), bot = Math.min(cr.bottom, vh);
+      var haveCenter = s.items.length >= 1 && s.center;
+      // a date text that does not change when the wheel moves is not a read-out: stop trusting it
+      if (W.prevHdr !== undefined && W.prevHdr !== null && s.header === W.prevHdr && haveCenter && W.prevRaw !== undefined && s.center.n !== W.prevRaw) W.hdrDead = true;
+      W.prevHdr = s.header; W.prevRaw = haveCenter ? s.center.n : undefined;
+      if (W.hdrDead) s.header = null;
+      var cn = (haveCenter && s.marked) ? s.center.n : (s.header !== null ? s.header : (haveCenter ? s.center.n : null));
+      if (cn === null) return { ok: false, err: "the wheel shows no readable items" };
+      var need = dp.n - cn;
+      if (need === 0) {
+        // the value must still be right a moment later (a wheel can settle back)
+        await sleep(350);
+        var s3 = wheelState(col, dp.kind), h3 = headerPart(col, dp.kind);
+        var c3 = (s3.center && s3.marked) ? s3.center.n : (h3 !== null ? h3 : (s3.center ? s3.center.n : null));
+        if (c3 === dp.n) { g.__ddgWheel = null; return { ok: true, via: "wheel" }; }
+        continue;
+      }
+      W.rounds++;
+      // learn how far the wheel really moves for a finger drag (some wheels fling, some move 1:1)
+      if (W.lastReq !== null && W.lastCur !== null) {
+        var moved = cn - W.lastCur;
+        if (moved === 0) W.noMove++;
+        else { W.noMove = 0; var gn = moved / W.lastReq; if (Math.abs(gn) > 0.05) W.gain = Math.max(-25, Math.min(25, gn)); }
+      }
       if (W.lastCenter === cn) W.stuck++; else W.stuck = 0;
-      if (W.lastDist !== null && Math.abs(need) > W.lastDist) W.flip = !W.flip;   // moved the wrong way: reverse
-      W.lastDist = Math.abs(need);
       W.lastCenter = cn;
-      if (W.stuck >= 4) { g.__ddgWheel = null; return { ok: false, err: "the " + dp.kind + " wheel would not move to " + p.wanted + " (stuck on " + cn + ")" }; }
-      var tgt = null;
-      s.items.forEach(function (i) { if (i.n === dp.n) tgt = i; });
-      var pick = tgt;
-      var down = (need * (s.sign || 1) > 0) !== W.flip;
-      if (!pick) pick = down ? s.items[s.items.length - 1] : s.items[0];
-      if (pick === s.center) { g.__ddgWheel = null; return { ok: false, err: "the wheel shows only one item, cannot move it" }; }
-      if (!W.synthDead) {
-        synthClick(pick.el);
-        await sleep(420);
-        var s2 = wheelState(col, dp.kind);
-        if (s2.items.length && s2.center.n !== cn) continue;
-        W.synthDead = true;   // the wheel ignores dispatched clicks
+      if (W.noMove >= 5 || W.rounds > 60) { g.__ddgWheel = null; return { ok: false, err: "the " + dp.kind + " wheel would not move to " + p.wanted + " (stuck on " + cn + ")" }; }
+
+      // first try plain taps on the target row (cheap), exactly as before
+      if (!W.synthDead && W.swipes === 0 && s.items.length >= 3 && s.center) {
+        var tgt = null; s.items.forEach(function (i) { if (i.n === dp.n) tgt = i; });
+        var down0 = (need * (s.sign || 1) > 0);
+        var pick = tgt || (down0 ? s.items[s.items.length - 1] : s.items[0]);
+        if (pick !== s.center) {
+          synthClick(pick.el, true);
+          await sleep(420);
+          var s2 = wheelState(col, dp.kind);
+          if (s2.items.length && s2.center && s2.center.n !== s.center.n) continue;
+          W.synthDead = true;   // the wheel ignores dispatched clicks
+          if (W.tapped !== true) { W.tapped = true; return { ok: false, stage: "wheel", err: "wheel needs a real tap", native: nativeInfo(pick.el, null, null, null, null, true) }; }
+        }
       }
-      // real finger: first taps, and when taps do nothing, drags
-      var nat = nativeInfo(pick.el);
-      if (W.stuck >= 2 || W.swipes) {
-        W.swipes++;
-        var far = down ? s.items[0] : s.items[s.items.length - 1];
-        var to = tgt ? s.center : far;
-        return { ok: false, stage: "wheel", err: "wheel needs a drag", swipe: { x: nat.x, y: nat.y, y2: to.cy, dpr: nat.dpr, vx: nat.vx, vy: nat.vy, vs: nat.vs } };
-      }
-      return { ok: false, stage: "wheel", err: "wheel needs a real tap", native: nat };
+      // real drag: how many rows to move, corrected by the learned gain
+      var sign = W.sign || 1, rowH = W.rowH || (bot - top) / 5 || 40;
+      var reqVal = need / (W.gain || 1);
+      if (W.noMove > 0) reqVal *= Math.pow(1.7, W.noMove);
+      var dy = -reqVal * sign * rowH;               // finger moves up when the wanted value lies further down the list
+      var maxTravel = Math.max(rowH, (bot - top) * 0.8);
+      var minTravel = 26;
+      if (Math.abs(dy) > maxTravel) dy = dy > 0 ? maxTravel : -maxTravel;
+      if (Math.abs(dy) < minTravel) dy = dy > 0 ? minTravel : -minTravel;
+      W.lastReq = -dy / sign / rowH * (W.gain || 1);    // the value change this drag is expected to cause at the current gain
+      W.lastCur = cn;
+      W.swipes++;
+      var mid = (top + bot) / 2, vv = col.ownerDocument.defaultView.visualViewport;
+      var nat = nativeInfo(col, null, null, null, null, true);
+      return { ok: false, stage: "wheel", err: "wheel needs a drag", swipe: { x: cr.left + cr.width / 2, y: mid - dy / 2, y2: mid + dy / 2, dpr: nat.dpr, vx: nat.vx, vy: nat.vy, vs: nat.vs } };
     }
     g.__ddgWheel = null;
     return { ok: false, err: "the wheel never reached " + p.wanted };
@@ -808,7 +878,7 @@
 
   // ------------------------------------------------------------------ click
   async function click(p) {
-    var labels = (p.labels || []).map(function (s) { return canon(s); }).filter(Boolean);
+    var labels = (p.labels || []).map(function (s) { return canon(s); }).filter(function (l) { return l && !/^(button|element|option|click|link|item|icon|div|span|text)$/.test(l); });
     var SEL = 'a,button,input[type=submit],input[type=button],input[type=image],[role=button],[role=link],[role=menuitem],[role=menuitemradio],[role=option],[role=tab],[role=treeitem],[onclick],[aria-haspopup],[aria-expanded],[aria-controls],[tabindex]:not([tabindex="-1"]),summary,li';
     function attr(el, a) { return (el.getAttribute(a) || "").toLowerCase().trim(); }
     function textMatches(el, exact) {
@@ -851,17 +921,20 @@
       });
       return loose.length ? clickable(loose[0]) : null;
     }
+    var lenient = false;
     function find() {
       var s = bySelectors(), t = byText();
       if (s) {
         if (!labels.length || !text(s.el) || textMatches(s.el, false)) return { el: clickable(s.el), via: s.via };
         if (t) return { el: t, via: "text" };
-        return { el: clickable(s.el), via: s.via + "?" };
+        // the recorded selector now points at a control with other text ("Continue with Email" instead of "Create account"):
+        // wait for the right one before settling for it
+        return lenient ? { el: clickable(s.el), via: s.via + "?" } : null;
       }
       return t ? { el: t, via: "text" } : null;
     }
     var start = Date.now(), hit = null;
-    while (Date.now() - start < ELEMENT_WAIT_MS) { hit = find(); if (hit) break; await sleep(300); }
+    while (Date.now() - start < ELEMENT_WAIT_MS) { lenient = Date.now() - start > ELEMENT_WAIT_MS * 0.6; hit = find(); if (hit) break; await sleep(300); }
     if (!hit) {
       var shown = deepAll("a,button").filter(visible).slice(0, 10).map(function (x) { return text(x).slice(0, 25); });
       return J({ ok: false, err: "click target not found. labels=" + JSON.stringify(p.labels || []) +
